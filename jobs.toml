@@ -1,0 +1,133 @@
+# GitHub repo -> Jenkins stage job(s). Copied from the build-trigger Lambda's
+# REPO_TO_JENKINS_JOB. Paths are relative to the Jenkins URL. A "?k=v" suffix
+# turns the call into /buildWithParameters with those parameters.
+#
+# This file is compiled into the binary. To change the mapping without
+# rebuilding, copy it to ~/.config/sts/jobs.toml and edit that copy.
+
+[repos]
+"Blitzscale-19/alfred" = ["/job/stage/job/web/job/dashboard/build?ENV=stage"]
+"Blitzscale-19/troubleshoot-automations" = ["/job/stage/job/finance/job/troubleshoot_automation/build"]
+"Blitzscale-19/aadesh" = [
+    "/job/stage/job/orders/job/aadesh/job/aadesh-app/build",
+    "/job/stage/job/orders/job/aadesh/job/aadesh-dash/build",
+    "/job/stage/job/orders/job/aadesh/job/aadesh-web/build",
+]
+"Blitzscale-19/aadesh_nirman" = [
+    "/job/stage/job/orders/job/aadesh-nirman/job/aadesh-nirman-app/build",
+    "/job/stage/job/orders/job/aadesh-nirman/job/aadesh-nirman-dash/build",
+    "/job/stage/job/orders/job/aadesh-nirman/job/aadesh-nirman-web/build",
+]
+"Blitzscale-19/aadesh_pragati" = [
+    "/job/stage/job/orders/job/aadesh-pragati/job/aadesh-pragati-app/build",
+    "/job/stage/job/orders/job/aadesh-pragati/job/aadesh-pragati-dash/build",
+]
+"Blitzscale-19/aadesh_prativedan" = [
+    "/job/stage/job/orders/job/aadesh-prativedan/job/aadesh-prativedan-app/build",
+    "/job/stage/job/orders/job/aadesh-prativedan/job/aadesh-prativedan-dash/build",
+]
+"Blitzscale-19/aadesh_vinash" = ["/job/stage/job/orders/job/aadesh-vinash/job/aadesh-vinash-dash/build"]
+"Blitzscale-19/aadhar_web" = ["/job/stage/job/finance/job/aadhar-web/build"]
+"Blitzscale-19/aadhar" = ["/job/stage/job/finance/job/aadhar-dash/job/aadhar-app/build"]
+"Blitzscale-19/aadhar_dash" = [
+    "/job/stage/job/finance/job/aadhar-dash/job/aadhar-dash-app/build",
+    "/job/stage/job/finance/job/aadhar-dash/job/aadhar-dash-dash/build",
+]
+"Blitzscale-19/batua" = [
+    "/job/stage/job/orders/job/batua/job/batua-app/build",
+    "/job/stage/job/orders/job/batua/job/batua-web/build",
+]
+"Blitzscale-19/bhugtan" = [
+    "/job/stage/job/finance/job/bhugtan/job/bhugtan-app/build",
+    "/job/stage/job/finance/job/bhugtan/job/bhugtan-dash/build",
+]
+"Blitzscale-19/bijganit" = ["/job/stage/job/orders/job/bijganit-dash/build"]
+"Blitzscale-19/bikri" = ["/job/stage/job/soochi/job/bikri-app/build"]
+"Blitzscale-19/chalan" = [
+    "/job/stage/job/orders/job/chalan/job/chalan-app/build",
+    "/job/stage/job/orders/job/chalan/job/chalan-dash/build",
+]
+"Blitzscale-19/coupon" = ["/job/stage/job/soochi/job/coupon-ts/job/coupon-app/build"]
+"Blitzscale-19/coupon_ts" = [
+    "/job/stage/job/soochi/job/coupon-ts/job/coupon-ts-app/build",
+    "/job/stage/job/soochi/job/coupon-ts/job/coupon-ts-dash/build",
+    "/job/stage/job/soochi/job/coupon-ts/job/coupon-ts-web/build",
+]
+"Blitzscale-19/dastavej" = ["/job/stage/job/orders/job/dastavej-dash/build"]
+"Blitzscale-19/dev_upkaran" = ["/job/stage/job/finance/job/dev-upkaran-dash/build"]
+"Blitzscale-19/facebook-analytics" = ["/job/stage/job/finance/job/facebook-analytics-app/build"]
+"Blitzscale-19/grahak_bhugtan" = [
+    "/job/stage/job/orders/job/grahak-bhugtan/job/grahak-bhugtan-app/build",
+    "/job/stage/job/orders/job/grahak-bhugtan/job/grahak-bhugtan-dash/build",
+    "/job/stage/job/orders/job/grahak-bhugtan/job/grahak-bhugtan-web/build",
+]
+"Blitzscale-19/grahak_vivran" = [
+    "/job/stage/job/finance/job/grahak-vivran/job/grahak-vivran-app/build",
+    "/job/stage/job/finance/job/grahak-vivran/job/grahak-vivran-dash/build",
+]
+"Blitzscale-19/kharidi" = ["/job/stage/job/orders/job/kharidi/job/kharidi-web/build"]
+"Blitzscale-19/khoj" = [
+    "/job/stage/job/soochi/job/khoj/job/khoj-app/build",
+    "/job/stage/job/soochi/job/khoj/job/khoj-web/build",
+]
+"Blitzscale-19/kie" = [
+    "/job/stage/job/finance/job/kie/job/kie-app/build",
+    "/job/stage/job/finance/job/kie/job/kie-dash/build",
+]
+"Blitzscale-19/laabh-haani" = ["/job/stage/job/finance/job/laabh-haani-app/build"]
+"Blitzscale-19/naarad" = [
+    "/job/stage/job/orders/job/naarad/job/naarad-app/build",
+    "/job/stage/job/orders/job/naarad/job/naarad-dash/build",
+]
+"Blitzscale-19/ndr" = [
+    "/job/stage/job/orders/job/ndr/job/ndr-app/build",
+    "/job/stage/job/orders/job/ndr/job/ndr-dash/build",
+]
+"Blitzscale-19/otp_service" = [
+    "/job/stage/job/finance/job/otp-services/job/otp-dash/build",
+    "/job/stage/job/finance/job/otp-services/job/otp-web/build",
+    "/job/stage/job/finance/job/otp-services/job/otp-app/build",
+]
+"Blitzscale-19/parichaalan" = [
+    "/job/stage/job/orders/job/parichalan/job/parichaalan-app/build",
+    "/job/stage/job/orders/job/parichalan/job/parichaalan-dash/build",
+]
+"Blitzscale-19/prashth" = [
+    "/job/stage/job/soochi/job/prashth/job/prashth-web/build",
+    "/job/stage/job/soochi/job/prashth/job/prashth-dash/build",
+]
+"Blitzscale-19/returns" = [
+    "/job/stage/job/orders/job/returns/job/returns-app/build",
+    "/job/stage/job/orders/job/returns/job/returns-dash/build",
+    "/job/stage/job/orders/job/returns/job/returns-web/build",
+]
+"Blitzscale-19/sauda" = [
+    "/job/stage/job/finance/job/sauda/job/sauda-app/build",
+    "/job/stage/job/finance/job/sauda/job/sauda-dash/build",
+    "/job/stage/job/finance/job/sauda/job/sauda-web/build",
+]
+"Blitzscale-19/soochi" = [
+    "/job/stage/job/soochi/job/soochi-dash/job/soochi-app/build",
+    "/job/stage/job/soochi/job/soochi-dash/job/soochi-dash/build",
+]
+"Blitzscale-19/soochi_dash" = [
+    "/job/stage/job/soochi/job/soochi-dash/job/soochi-dash-app/build",
+    "/job/stage/job/soochi/job/soochi-dash/job/soochi-dash-dash/build",
+]
+"Blitzscale-19/soochi_web" = ["/job/stage/job/soochi/job/soochi-web/build"]
+"Blitzscale-19/suchna" = [
+    "/job/stage/job/finance/job/suchna-dash/build",
+    "/job/stage/job/finance/job/suchna-app/build",
+]
+"Blitzscale-19/titanic" = ["/job/stage/job/orders/job/titanic/job/titanic-app/build"]
+"Blitzscale-19/vartalap" = ["/job/stage/job/soochi/job/vartalap-app/build"]
+"Blitzscale-19/vikreta-chalan" = [
+    "/job/stage/job/finance/job/vikreta-chalan/job/vikreta-chalan-app/build",
+    "/job/stage/job/finance/job/vikreta-chalan/job/vikreta-chalan-dash/build",
+]
+"Blitzscale-19/the-warden" = [
+    "/job/stage/job/finance/job/the-warden-app/build",
+    "/job/stage/job/finance/job/the-warden-dash/build",
+]
+"Blitzscale-19/vyaapar_ank" = ["/job/stage/job/orders/job/vyaapar-ank-dash/build"]
+"Blitzscale-19/ob-operations" = ["/job/stage/job/orders/job/ob-operations/build"]
