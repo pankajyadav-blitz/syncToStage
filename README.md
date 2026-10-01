@@ -22,8 +22,16 @@ sts -sy                 # same, no confirmation
 7. Triggers the Jenkins job(s) mapped to the repo in `jobs.toml` and prints the build URLs.
    If the repo isn't mapped, it says so: pushed to stage, build not triggered.
 
-On a merge conflict, nothing is pushed. Merge `origin/stage` into your branch,
-resolve the conflict, and run it again.
+If you run `sts -s` while on `stage` itself, it pulls `origin/stage` into your local
+`stage`, pushes it back to `origin/stage` and triggers Jenkins. If the pull
+conflicts, it is aborted and nothing is pushed.
+
+The merge always goes one way: your branch into `stage`. `stage` is never merged
+into your branch, because it carries code from other branches that doesn't belong there.
+
+On a merge conflict, the merge is aborted: nothing is merged or pushed and your
+branch is left unchanged. `sts` lists the conflicting files. If you want to resolve
+the conflict, do it on a throwaway branch cut from `origin/stage`, not on your branch.
 
 ## Flags
 

@@ -116,24 +116,19 @@ fn main() {
 
 fn ship(a: ShipArgs) -> Result<()> {
     let repo_dir = repo_root()?;
-    let source = match a.from {
-        Some(b) => b,
+    let source = match &a.from {
+        Some(b) => b.clone(),
         None => git::current_branch(&repo_dir)?,
     };
     if source == STAGE {
-        bail!("you are on `{STAGE}`; check out the branch you want to merge (or pass -f <branch>)");
+        if git::current_branch(&repo_dir).ok().as_deref() != Some(STAGE) {
+            bail!("check out `{STAGE}` to ship it directly (or pass -f <branch>)");
+        }
+        return ship_stage(a, &repo_dir);
     }
     let source_sha = git::rev(&repo_dir, &format!("refs/heads/{source}"))
         .with_context(|| format!("no local branch named `{source}`"))?;
-    let slug = resolve_slug(&repo_dir, a.repo)?;
-    let map = JobMap::load()?;
-    let jobs = map.lookup(&slug);
-
-    // Check Jenkins before pushing, so a bad token doesn't leave stage pushed but unbuilt.
-    let jenkins = match (&jobs, a.no_build) {
-        (Some(_), false) => Some(connect().context("use -n to push without building")?),
-        _ => None,
-    };
+    let (slug, jobs, jenkins) = prepare_jenkins(&repo_dir, a.repo.clone(), a.no_build)?;
 
     step(&format!("Fetching {REMOTE}/{STAGE}"));
     fetch_stage(&repo_dir)?;
@@ -162,16 +157,7 @@ fn ship(a: ShipArgs) -> Result<()> {
     if !dirty.is_empty() {
         println!("  note      uncommitted changes in your working tree are NOT included");
     }
-    match (&jobs, a.no_build) {
-        (_, true) => println!("  jenkins   skipped (-n)"),
-        (None, _) => println!("  jenkins   no job mapped for {slug} (see `sts -ja`)"),
-        (Some(jobs), _) => {
-            println!("  jenkins   {} job(s):", jobs.len());
-            for j in jobs {
-                println!("              {}", j.raw);
-            }
-        }
-    }
+    print_jenkins_plan(&slug, &jobs, a.no_build);
     println!();
 
     if a.dry_run {
@@ -194,12 +180,143 @@ fn ship(a: ShipArgs) -> Result<()> {
     println!("Pushed {STAGE} at {}", short(&pushed));
     update_local_stage(&repo_dir, &pushed);
 
-    if a.no_build {
+    finish_build(&slug, jobs, jenkins, a.no_build, a.wait)
+}
+
+/// Shipping from `stage` itself: pull origin/stage into the checked-out local
+/// stage, push it back, and build. On a conflict the pull is aborted and
+/// nothing is pushed.
+fn ship_stage(a: ShipArgs, repo_dir: &Path) -> Result<()> {
+    let (slug, jobs, jenkins) = prepare_jenkins(repo_dir, a.repo.clone(), a.no_build)?;
+
+    step(&format!("Fetching {REMOTE}/{STAGE}"));
+    fetch_stage(repo_dir)?;
+    let remote_stage = format!("{REMOTE}/{STAGE}");
+    let remote_stage_sha = git::rev(repo_dir, &remote_stage)
+        .with_context(|| format!("{remote_stage} does not exist"))?;
+    let local_sha = git::rev(repo_dir, &format!("refs/heads/{STAGE}"))
+        .context("reading local stage")?;
+
+    let range_log = |range: String| {
+        git::run(repo_dir, &["log", "--oneline", "--no-decorate", &range])
+    };
+    let to_pull = range_log(format!("refs/heads/{STAGE}..{remote_stage}"))?;
+    let to_push = range_log(format!("{remote_stage}..refs/heads/{STAGE}"))?;
+
+    println!();
+    println!("  repo      {slug}");
+    println!("  local     {STAGE} ({})", short(&local_sha));
+    println!("  remote    {remote_stage} ({})", short(&remote_stage_sha));
+    println!("  pull      {} commit(s) from {remote_stage}", to_pull.lines().count());
+    if to_push.is_empty() {
+        println!("  push      nothing new (local {STAGE} has no commits {remote_stage} lacks)");
+    } else {
+        println!("  push      {} local commit(s):", to_push.lines().count());
+        for l in to_push.lines().take(15) {
+            println!("              {l}");
+        }
+    }
+    print_jenkins_plan(&slug, &jobs, a.no_build);
+    println!();
+
+    if a.dry_run {
+        println!("Dry run: nothing pulled, pushed or built.");
+        return Ok(());
+    }
+    if !a.yes && !confirm(&format!("Pull {remote_stage} into {STAGE}, push and build?"))? {
+        bail!("aborted");
+    }
+
+    pull_and_push_stage(repo_dir, &remote_stage)?;
+    finish_build(&slug, jobs, jenkins, a.no_build, a.wait)
+}
+
+/// Merges origin/stage into the checked-out local stage and pushes it.
+/// Retries if someone else pushed in the meantime. Never force-pushes.
+fn pull_and_push_stage(repo_dir: &Path, remote_stage: &str) -> Result<()> {
+    const ATTEMPTS: u32 = 3;
+    for attempt in 1..=ATTEMPTS {
+        if attempt > 1 {
+            fetch_stage(repo_dir)?;
+        }
+
+        step(&format!("Pulling {remote_stage} into {STAGE}"));
+        let merge = git::try_run(repo_dir, &["merge", "--no-edit", remote_stage])?;
+        if !merge.ok {
+            let conflicts = git::run(repo_dir, &["diff", "--name-only", "--diff-filter=U"])
+                .unwrap_or_default();
+            if conflicts.is_empty() {
+                bail!("pull failed:\n{}\n{}", merge.stdout, merge.stderr);
+            }
+            let _ = git::try_run(repo_dir, &["merge", "--abort"]);
+            bail!(
+                "merge conflict between local {STAGE} and {remote_stage} in:\n{}\n\n\
+                 Pull aborted: nothing was merged or pushed, and local {STAGE} was not changed.",
+                indent(&conflicts)
+            );
+        }
+
+        step(&format!("Pushing to {REMOTE}/{STAGE}"));
+        let push = git::try_run(
+            repo_dir,
+            &["push", REMOTE, &format!("refs/heads/{STAGE}:refs/heads/{STAGE}")],
+        )?;
+        if push.ok {
+            let sha = git::rev(repo_dir, &format!("refs/heads/{STAGE}")).unwrap_or_default();
+            println!("Pushed {STAGE} at {}", short(&sha));
+            return Ok(());
+        }
+        if push_raced(&push.stderr) && attempt < ATTEMPTS {
+            println!("{STAGE} changed on {REMOTE} while pulling; retrying ({attempt}/{ATTEMPTS})");
+            continue;
+        }
+        bail!("push to {STAGE} failed:\n{}", push.stderr);
+    }
+    unreachable!()
+}
+
+/// Looks up the repo's Jenkins jobs and, unless `no_build`, checks the login
+/// before anything is pushed, so a bad token doesn't leave stage pushed but unbuilt.
+fn prepare_jenkins(
+    repo_dir: &Path,
+    repo: Option<String>,
+    no_build: bool,
+) -> Result<(String, Option<Vec<Job>>, Option<Jenkins>)> {
+    let slug = resolve_slug(repo_dir, repo)?;
+    let jobs = JobMap::load()?.lookup(&slug);
+    let jenkins = match (&jobs, no_build) {
+        (Some(_), false) => Some(connect().context("use -n to push without building")?),
+        _ => None,
+    };
+    Ok((slug, jobs, jenkins))
+}
+
+fn print_jenkins_plan(slug: &str, jobs: &Option<Vec<Job>>, no_build: bool) {
+    match (jobs, no_build) {
+        (_, true) => println!("  jenkins   skipped (-n)"),
+        (None, _) => println!("  jenkins   no job mapped for {slug} (see `sts -ja`)"),
+        (Some(jobs), _) => {
+            println!("  jenkins   {} job(s):", jobs.len());
+            for j in jobs {
+                println!("              {}", j.raw);
+            }
+        }
+    }
+}
+
+fn finish_build(
+    slug: &str,
+    jobs: Option<Vec<Job>>,
+    jenkins: Option<Jenkins>,
+    no_build: bool,
+    wait: u64,
+) -> Result<()> {
+    if no_build {
         println!("Pushed to {STAGE}; build not triggered (-n).");
         return Ok(());
     }
     match (jobs, jenkins) {
-        (Some(jobs), Some(jenkins)) => trigger_all(&jenkins, &jobs, a.wait),
+        (Some(jobs), Some(jenkins)) => trigger_all(&jenkins, &jobs, wait),
         _ => {
             println!(
                 "Pushed to {STAGE}, but no Jenkins job is mapped for {slug}; build not triggered."
@@ -207,6 +324,20 @@ fn ship(a: ShipArgs) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// "[rejected] (fetch first)" when stage moved before the push started;
+/// "cannot lock ref" when it moved while the push was in flight.
+fn push_raced(stderr: &str) -> bool {
+    [
+        "[rejected]",
+        "non-fast-forward",
+        "fetch first",
+        "cannot lock ref",
+        "(failed to update ref)",
+    ]
+    .iter()
+    .any(|s| stderr.contains(s))
 }
 
 fn fetch_stage(repo_dir: &Path) -> Result<()> {
@@ -248,12 +379,16 @@ fn merge_and_push(repo_dir: &Path, source: &str, remote_stage: &str) -> Result<S
             if conflicts.is_empty() {
                 bail!("merge failed:\n{}\n{}", merge.stdout, merge.stderr);
             }
+            // Never suggest merging stage into the source branch: stage carries
+            // code from other branches that must not leak into it.
             bail!(
                 "merge conflict between `{source}` and {remote_stage} in:\n{}\n\n\
-                 Nothing was pushed. Fix it on your branch, then ship again:\n  \
-                 git fetch {REMOTE} && git merge {remote_stage}\n  \
+                 Merge aborted: nothing was merged or pushed, and `{source}` was not changed.\n\
+                 Do NOT merge {STAGE} into `{source}`. To resolve it on {STAGE} instead:\n  \
+                 git switch -c {STAGE}-merge-{source} {remote_stage}\n  \
+                 git merge {source}\n  \
                  # resolve, commit\n  \
-                 sts -s",
+                 git push {REMOTE} HEAD:{STAGE}",
                 indent(&conflicts)
             );
         }
@@ -263,18 +398,7 @@ fn merge_and_push(repo_dir: &Path, source: &str, remote_stage: &str) -> Result<S
         if push.ok {
             return git::rev(&wt.path, "HEAD").context("reading merged commit");
         }
-        // "[rejected] (fetch first)" when stage moved before the push started;
-        // "cannot lock ref" when it moved while the push was in flight.
-        let raced = [
-            "[rejected]",
-            "non-fast-forward",
-            "fetch first",
-            "cannot lock ref",
-            "(failed to update ref)",
-        ]
-            .iter()
-            .any(|s| push.stderr.contains(s));
-        if raced && attempt < ATTEMPTS {
+        if push_raced(&push.stderr) && attempt < ATTEMPTS {
             println!("{STAGE} changed on {REMOTE} while merging; retrying ({attempt}/{ATTEMPTS})");
             continue;
         }
