@@ -1,7 +1,7 @@
 # sts
 
-Ship your branch to `stage` and trigger the Jenkins stage build from your machine,
-without going through the build-trigger Lambda.
+Ship your branch to `stage`, trigger the Jenkins stage build from your machine
+(without going through the build-trigger Lambda), and sync ArgoCD once the build succeeds.
 
 ```sh
 cd ~/home/soochi_dash   # any repo, on your feature branch
@@ -21,6 +21,23 @@ sts -sy                 # same, no confirmation
 6. Resets your local `stage` branch to the pushed commit.
 7. Triggers the Jenkins job(s) mapped to the repo in `jobs.toml` and prints the build URLs.
    If the repo isn't mapped, it says so: pushed to stage, build not triggered.
+8. Schedules the ArgoCD sync (unless `-A`, see below).
+
+## ArgoCD sync after the build
+
+Each triggered build is added to `~/.local/state/sts/pending.json`, and a crontab
+entry (tagged `# sts-watch`) runs `sts --watch` every minute. Each run:
+
+- waits for the build to leave the Jenkins queue and finish;
+- on `SUCCESS`, reads the build's console for the chart it updated
+  (`stage-argocd-helm/<chart>/values.yaml`), finds the ArgoCD app whose source path
+  is that chart (e.g. chart `aadesh-app` is app `aadesh-app-test`), hard-refreshes it
+  and syncs it. "Sync already in progress" (e.g. started by the Jenkinsfile) counts as done;
+- on `FAILURE`/`ABORTED`/cancelled, drops it without deploying;
+- retries a failed sync up to 3 times, and gives up on builds older than 4 hours.
+
+When nothing is pending, the crontab entry removes itself. `sts -P` shows the queue;
+the log is `~/.local/state/sts/watch.log`.
 
 If you run `sts -s` while on `stage` itself, it pulls `origin/stage` into your local
 `stage`, pushes it back to `origin/stage` and triggers Jenkins. If the pull
@@ -42,13 +59,16 @@ Short flags combine: `-sy`, `-sd`, `-sny`, `-ja`.
 | `-s, --ship` | merge current branch into stage, push, trigger Jenkins |
 | `-b, --build` | trigger this repo's Jenkins job(s) only, no git |
 | `-j, --jobs` | show this repo's Jenkins jobs (`-ja` for every repo) |
-| `-c, --check` | test the config and credentials |
+| `-c, --check` | test the Jenkins and ArgoCD config and credentials |
+| `-P, --pending` | show builds waiting to be synced to ArgoCD |
+| `-W, --watch` | run one watcher tick (what cron runs) |
 
 | option | |
 |---|---|
 | `-y, --yes` | no confirmation prompt |
 | `-d, --dry-run` | show the plan; merge/push/build nothing |
 | `-n, --no-build` | with `-s`: push only |
+| `-A, --no-argo` | with `-s`/`-b`: don't sync ArgoCD after the build |
 | `-p, --push-branch` | with `-s`: also push your branch to origin first |
 | `-f, --from <branch>` | with `-s`: merge a branch other than the current one |
 | `-r, --repo <owner/name>` | override the repo used for the job lookup |
@@ -63,13 +83,17 @@ cat > ~/.config/sts/config.toml <<'EOF'
 url   = "https://jenkins-stage-aws.sdloki.in"
 user  = "your-jenkins-username"
 token = "your-jenkins-api-token"
+argocd_url   = "https://argocd-stage-aws.sdloki.in"   # default
+argocd_token = "your-argocd-api-token"
 EOF
 chmod 600 ~/.config/sts/config.toml
 sts -c
 ```
 
-`JENKINS_URL`, `JENKINS_USER`, `JENKINS_TOKEN` (and optionally `JENKINS_CRUMB`)
-override the file.
+`JENKINS_URL`, `JENKINS_USER`, `JENKINS_TOKEN` (and optionally `JENKINS_CRUMB`),
+`ARGOCD_URL` and `ARGOCD_TOKEN` override the file. Cron doesn't see your shell's
+environment, so keep the tokens in the file for the ArgoCD sync to work.
+Without `argocd_token`, builds are triggered but ArgoCD isn't synced.
 
 Create the API token in Jenkins under your user, then **Security** (or **Configure**),
 then **API Token**, then **Add new Token**. Requests made with an API token don't

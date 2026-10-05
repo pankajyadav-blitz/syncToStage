@@ -20,12 +20,69 @@ pub fn config_file() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// `$XDG_STATE_HOME/sts`, falling back to `~/.local/state/sts`. Holds the
+/// pending-deploy queue and the watcher log.
+pub fn state_dir() -> PathBuf {
+    if let Ok(dir) = env::var("XDG_STATE_HOME")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir).join("sts");
+    }
+    PathBuf::from(env::var("HOME").unwrap_or_default())
+        .join(".local")
+        .join("state")
+        .join("sts")
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
     url: Option<String>,
     user: Option<String>,
     token: Option<String>,
     crumb: Option<String>,
+    argocd_url: Option<String>,
+    argocd_token: Option<String>,
+}
+
+pub const DEFAULT_ARGOCD_URL: &str = "https://argocd-stage-aws.sdloki.in";
+
+#[derive(Debug, Clone)]
+pub struct ArgoConfig {
+    pub url: String,
+    pub token: String,
+}
+
+fn read_file() -> Result<FileConfig> {
+    let path = config_file();
+    if !path.exists() {
+        return Ok(FileConfig::default());
+    }
+    warn_if_readable_by_others(&path);
+    let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    toml::from_str::<FileConfig>(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Env var if set and non-blank, else the file value if non-blank.
+fn pick(var: &str, from_file: Option<String>) -> Option<String> {
+    env::var(var)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or(from_file.filter(|v| !v.trim().is_empty()))
+        .map(|v| v.trim().to_string())
+}
+
+/// ArgoCD settings; `None` when no token is configured (sync is then skipped).
+/// ARGOCD_URL / ARGOCD_TOKEN win over `argocd_url` / `argocd_token` in the file.
+pub fn load_argo() -> Result<Option<ArgoConfig>> {
+    let file = read_file()?;
+    let Some(token) = pick("ARGOCD_TOKEN", file.argocd_token) else {
+        return Ok(None);
+    };
+    let url = pick("ARGOCD_URL", file.argocd_url).unwrap_or_else(|| DEFAULT_ARGOCD_URL.into());
+    Ok(Some(ArgoConfig {
+        url: url.trim_end_matches('/').to_string(),
+        token,
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -40,22 +97,7 @@ pub struct JenkinsConfig {
 /// Env vars (JENKINS_URL / JENKINS_USER / JENKINS_TOKEN / JENKINS_CRUMB) win over the file.
 pub fn load() -> Result<JenkinsConfig> {
     let path = config_file();
-    let file = if path.exists() {
-        warn_if_readable_by_others(&path);
-        let text =
-            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str::<FileConfig>(&text).with_context(|| format!("parsing {}", path.display()))?
-    } else {
-        FileConfig::default()
-    };
-
-    let pick = |var: &str, from_file: Option<String>| {
-        env::var(var)
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .or(from_file.filter(|v| !v.trim().is_empty()))
-            .map(|v| v.trim().to_string())
-    };
+    let file = read_file()?;
 
     let url = pick("JENKINS_URL", file.url);
     let user = pick("JENKINS_USER", file.user);

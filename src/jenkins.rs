@@ -21,6 +21,16 @@ pub struct Queued {
     pub queue_url: Option<String>,
 }
 
+pub enum QueueState {
+    Waiting,
+    Started(String),
+    Cancelled,
+    /// 404: the item expired from the queue.
+    Gone,
+    /// Network error or unexpected response; try again later.
+    Unknown,
+}
+
 impl Jenkins {
     pub fn new(cfg: JenkinsConfig) -> Jenkins {
         let agent: Agent = Agent::config_builder()
@@ -61,7 +71,10 @@ impl Jenkins {
             300..=399 => bail!(
                 "Jenkins redirected {url} (HTTP {status}). Use the final URL (https?) as `url`."
             ),
-            _ => bail!("Jenkins returned HTTP {status} for {url}: {}", snippet(&body)),
+            _ => bail!(
+                "Jenkins returned HTTP {status} for {url}: {}",
+                snippet(&body)
+            ),
         }
     }
 
@@ -93,9 +106,7 @@ impl Jenkins {
                 location.unwrap_or_default()
             ),
             400 if body.contains("is parameterized") || body.contains("Nothing is submitted") => {
-                bail!(
-                    "HTTP 400: job is parameterized; add `?PARAM=value` to its path in jobs.toml"
-                )
+                bail!("HTTP 400: job is parameterized; add `?PARAM=value` to its path in jobs.toml")
             }
             401 => bail!("HTTP 401: Jenkins rejected the credentials"),
             403 if body.contains("crumb") => bail!(
@@ -110,25 +121,79 @@ impl Jenkins {
     /// Polls the queue item until Jenkins assigns a build, up to `deadline`.
     /// Returns the build URL, or None if it is still queued (or the queue is unreadable).
     pub fn wait_for_build(&self, queue_url: &str, deadline: Instant) -> Option<String> {
-        let api = format!("{}/api/json", queue_url.trim_end_matches('/'));
         loop {
-            if let Ok(mut resp) = self.get(&api)
-                && resp.status().as_u16() == 200
-                && let Ok(body) = resp.body_mut().read_to_string()
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
-            {
-                if let Some(url) = v["executable"]["url"].as_str() {
-                    return Some(url.to_string());
-                }
-                if v["cancelled"].as_bool() == Some(true) {
-                    return None;
-                }
+            match self.queue_state(queue_url) {
+                QueueState::Started(url) => return Some(url),
+                QueueState::Cancelled | QueueState::Gone => return None,
+                QueueState::Waiting | QueueState::Unknown => {}
             }
             if Instant::now() >= deadline {
                 return None;
             }
             sleep(Duration::from_secs(2));
         }
+    }
+
+    /// One look at a queue item.
+    pub fn queue_state(&self, queue_url: &str) -> QueueState {
+        let api = format!("{}/api/json", queue_url.trim_end_matches('/'));
+        let Ok(mut resp) = self.get(&api) else {
+            return QueueState::Unknown;
+        };
+        match resp.status().as_u16() {
+            200 => {}
+            // Jenkins drops queue items a few minutes after the build starts.
+            404 => return QueueState::Gone,
+            _ => return QueueState::Unknown,
+        }
+        let Some(v) = resp
+            .body_mut()
+            .read_to_string()
+            .ok()
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+        else {
+            return QueueState::Unknown;
+        };
+        if let Some(url) = v["executable"]["url"].as_str() {
+            return QueueState::Started(url.to_string());
+        }
+        if v["cancelled"].as_bool() == Some(true) {
+            return QueueState::Cancelled;
+        }
+        QueueState::Waiting
+    }
+
+    /// `None` while the build is running, else its result (SUCCESS, FAILURE, ABORTED, ...).
+    pub fn build_result(&self, build_url: &str) -> Result<Option<String>> {
+        let api = format!(
+            "{}/api/json?tree=building,result",
+            build_url.trim_end_matches('/')
+        );
+        let mut resp = self.get(&api)?;
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        if status != 200 {
+            bail!("HTTP {status} for {api}: {}", snippet(&body));
+        }
+        let v: serde_json::Value = serde_json::from_str(&body).context("parsing build status")?;
+        if v["building"].as_bool() == Some(true) {
+            return Ok(None);
+        }
+        Ok(Some(v["result"].as_str().unwrap_or("UNKNOWN").to_string()))
+    }
+
+    pub fn console_text(&self, build_url: &str) -> Result<String> {
+        let url = format!("{}/consoleText", build_url.trim_end_matches('/'));
+        let mut resp = self.get(&url)?;
+        let status = resp.status().as_u16();
+        if status != 200 {
+            bail!("HTTP {status} for {url}");
+        }
+        resp.body_mut()
+            .with_config()
+            .limit(64 * 1024 * 1024)
+            .read_to_string()
+            .with_context(|| format!("reading {url}"))
     }
 
     fn get(&self, url: &str) -> Result<Response<Body>> {
