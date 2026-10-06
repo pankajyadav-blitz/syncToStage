@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -25,6 +26,8 @@ const MAX_SYNC_ATTEMPTS: u32 = 3;
 /// How often the watcher polls. cron's floor is 1 minute, so a single `--watch`
 /// run loops internally, firing a tick every `WATCH_INTERVAL_SECS` for one minute.
 const WATCH_INTERVAL_SECS: u64 = 10;
+/// How often `sts -S` refreshes the live sync view on a terminal.
+const SYNC_POLL_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pending {
@@ -151,6 +154,76 @@ impl Queue {
     }
 }
 
+/// An ArgoCD app we told to sync, tracked by `sts -S` until it settles
+/// (Synced + Healthy). Only syncs this tool triggered are recorded here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Syncing {
+    pub app: String,
+    /// The build whose success triggered this sync, for display.
+    pub build_url: Option<String>,
+    pub repo: String,
+    pub started_at: u64,
+}
+
+/// The syncing list: ArgoCD apps `sts --watch` has synced, held under an
+/// exclusive file lock while open. Pruned by `sts -S` once each app settles.
+struct SyncQueue {
+    _lock: File,
+    items: Vec<Syncing>,
+}
+
+fn syncing_file() -> PathBuf {
+    config::state_dir().join("syncing.json")
+}
+
+impl SyncQueue {
+    fn open() -> Result<SyncQueue> {
+        let lock = Self::lock_file()?;
+        lock.lock().context("locking the syncing list")?;
+        let items = match fs::read_to_string(syncing_file()) {
+            Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)
+                .with_context(|| format!("parsing {}", syncing_file().display()))?,
+            _ => Vec::new(),
+        };
+        Ok(SyncQueue { _lock: lock, items })
+    }
+
+    fn lock_file() -> Result<File> {
+        let dir = config::state_dir();
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join("syncing.lock");
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))
+    }
+
+    fn save(&self) -> Result<()> {
+        let path = syncing_file();
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_string_pretty(&self.items)?)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// Records apps the watcher just synced so `sts -S` can track them. A repeat
+/// sync of an app already listed just refreshes its entry.
+fn record_syncing(entries: Vec<Syncing>) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut q = SyncQueue::open()?;
+    for e in entries {
+        q.items.retain(|s| s.app != e.app);
+        q.items.push(e);
+    }
+    q.save()
+}
+
 /// Adds builds to the queue and makes sure the cron watcher is installed.
 pub fn enqueue(entries: Vec<Pending>) -> Result<()> {
     if entries.is_empty() {
@@ -196,6 +269,103 @@ pub fn show() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `sts --sync-status`: show the ArgoCD apps we synced and their live sync/health,
+/// dropping each once it reaches Synced + Healthy (or vanishes). On a terminal it
+/// refreshes in place every few seconds until the list is empty; piped or
+/// redirected it prints a single snapshot and exits.
+pub fn sync_status() -> Result<()> {
+    let live = std::io::stdout().is_terminal();
+    loop {
+        if live {
+            clear_screen();
+            println!("sts -S  —  {}  (Ctrl-C to stop)", utc_now());
+        }
+        let empty = sync_status_once()?;
+        if empty || !live {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(SYNC_POLL_SECS));
+    }
+}
+
+/// One pass: poll ArgoCD for each tracked app, print the status, prune settled
+/// ones, and save. Returns true when nothing is left to track. The queue lock is
+/// released as soon as this returns, so the cron watcher can enqueue new syncs
+/// between polls.
+fn sync_status_once() -> Result<bool> {
+    let mut q = SyncQueue::open()?;
+    println!("tracking: {}", syncing_file().display());
+    if q.items.is_empty() {
+        println!("No ArgoCD syncs in progress.");
+        return Ok(true);
+    }
+
+    let Some(argo_cfg) = config::load_argo()? else {
+        println!(
+            "no ArgoCD token configured (argocd_token in config.toml); can't check sync status"
+        );
+        // Can't make progress without a token; treat as done so we don't spin.
+        return Ok(true);
+    };
+    let argo = Argo::new(argo_cfg);
+
+    let t = now();
+    let mut keep = Vec::new();
+    let mut done = Vec::new();
+    for s in std::mem::take(&mut q.items) {
+        // Stop tracking anything that never settles so the list can't grow forever.
+        if t.saturating_sub(s.started_at) > MAX_AGE_SECS {
+            done.push(format!(
+                "  gave up   {}  (still not settled after {}m)",
+                s.app,
+                MAX_AGE_SECS / 60
+            ));
+            continue;
+        }
+        match argo.status(&s.app) {
+            Ok(None) => done.push(format!("  gone      {}  (no such ArgoCD app)", s.app)),
+            Ok(Some(st)) if st.is_settled() => {
+                done.push(format!("  synced    {}  ({})", s.app, st.health))
+            }
+            Ok(Some(st)) => {
+                let phase = if st.phase.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {}", st.phase)
+                };
+                println!(
+                    "  syncing   {:<28} {}/{}{phase}  ({}m ago, {})",
+                    s.app,
+                    st.sync,
+                    st.health,
+                    t.saturating_sub(s.started_at) / 60,
+                    s.repo,
+                );
+                keep.push(s);
+            }
+            Err(e) => {
+                // Keep it; a transient error shouldn't lose the entry.
+                println!("  ?         {}  (status check failed: {e:#})", s.app);
+                keep.push(s);
+            }
+        }
+    }
+
+    q.items = keep;
+    q.save()?;
+
+    if !done.is_empty() {
+        for line in &done {
+            println!("{line}");
+        }
+    }
+    if q.items.is_empty() {
+        println!("All tracked ArgoCD syncs have settled.");
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// What cron runs: polls every `WATCH_INTERVAL_SECS` for one minute by looping
@@ -354,18 +524,44 @@ fn deploy(jenkins: &Jenkins, argo: &Argo, apps: &[App], p: &Pending) -> Result<(
     }
 
     let mut failed = Vec::new();
+    let mut synced = Vec::new();
     for app in targets {
         match argo.refresh_and_sync(app) {
-            Ok(SyncOutcome::Started) => log(&format!(
-                "{build_url}: SUCCESS -> ArgoCD sync started for {app} ({}/applications/{app})",
-                argo.url()
-            )),
-            Ok(SyncOutcome::AlreadyRunning) => log(&format!(
-                "{build_url}: SUCCESS -> ArgoCD sync already running for {app}"
-            )),
+            Ok(SyncOutcome::Started) => {
+                log(&format!(
+                    "{build_url}: SUCCESS -> ArgoCD sync started for {app} ({}/applications/{app})",
+                    argo.url()
+                ));
+                synced.push(app.to_string());
+            }
+            Ok(SyncOutcome::AlreadyRunning) => {
+                log(&format!(
+                    "{build_url}: SUCCESS -> ArgoCD sync already running for {app}"
+                ));
+                synced.push(app.to_string());
+            }
             Err(e) => failed.push(format!("{e:#}")),
         }
     }
+
+    // Track every app we synced (or that was already syncing) so `sts -S` can
+    // show it until ArgoCD reports it Synced + Healthy.
+    if !synced.is_empty() {
+        let now = now();
+        let entries = synced
+            .into_iter()
+            .map(|app| Syncing {
+                app,
+                build_url: p.build_url.clone(),
+                repo: p.repo.clone(),
+                started_at: now,
+            })
+            .collect();
+        if let Err(e) = record_syncing(entries) {
+            log(&format!("{build_url}: could not record sync status: {e:#}"));
+        }
+    }
+
     if !failed.is_empty() {
         bail!("{}", failed.join("; "));
     }
@@ -374,6 +570,13 @@ fn deploy(jenkins: &Jenkins, argo: &Argo, apps: &[App], p: &Pending) -> Result<(
 
 fn log(msg: &str) {
     println!("{} {msg}", utc_now());
+}
+
+/// Clear the terminal and move the cursor home, so the live `sts -S` view
+/// redraws in place instead of scrolling.
+fn clear_screen() {
+    print!("\x1b[2J\x1b[H");
+    let _ = std::io::stdout().flush();
 }
 
 // ---- crontab ----------------------------------------------------------------

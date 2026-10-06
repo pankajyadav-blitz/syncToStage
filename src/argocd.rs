@@ -24,6 +24,27 @@ pub enum SyncOutcome {
     AlreadyRunning,
 }
 
+/// Live sync/health of an ArgoCD app, as shown by `sts -S`.
+pub struct AppStatus {
+    /// `Synced` / `OutOfSync` / `Unknown` (`status.sync.status`).
+    pub sync: String,
+    /// `Healthy` / `Progressing` / `Degraded` / ... (`status.health.status`).
+    pub health: String,
+    /// Phase of the running/last operation, e.g. `Running`, `Succeeded`, `Error`
+    /// (`status.operationState.phase`); empty when there is none.
+    pub phase: String,
+}
+
+impl AppStatus {
+    /// Done once ArgoCD reports the app Synced and Healthy with no operation
+    /// still running. These are the entries `sts -S` prunes.
+    pub fn is_settled(&self) -> bool {
+        self.sync == "Synced"
+            && self.health == "Healthy"
+            && !self.phase.eq_ignore_ascii_case("Running")
+    }
+}
+
 impl Argo {
     pub fn new(cfg: ArgoConfig) -> Argo {
         let agent: Agent = Agent::config_builder()
@@ -112,6 +133,31 @@ impl Argo {
             404 => bail!("sync of {app}: ArgoCD app not found"),
             _ => bail!("sync of {app}: HTTP {status}: {}", snippet(&body)),
         }
+    }
+
+    /// Live sync/health of a single app. `404` means the app is gone, which
+    /// `sts -S` treats as settled (nothing left to track).
+    pub fn status(&self, app: &str) -> Result<Option<AppStatus>> {
+        let v = match self.get_json(&format!("/api/v1/applications/{app}")) {
+            Ok(v) => v,
+            Err(e) if e.to_string().contains("HTTP 404") => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let status = &v["status"];
+        Ok(Some(AppStatus {
+            sync: status["sync"]["status"]
+                .as_str()
+                .unwrap_or("Unknown")
+                .to_string(),
+            health: status["health"]["status"]
+                .as_str()
+                .unwrap_or("Unknown")
+                .to_string(),
+            phase: status["operationState"]["phase"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        }))
     }
 
     fn get_json(&self, path: &str) -> Result<serde_json::Value> {
@@ -214,5 +260,36 @@ cicd/helm/stage-argocd-helm/other/Chart.yaml\n";
         );
         assert_eq!(app_for_chart(&apps, "keda").unwrap().name, "keda");
         assert!(app_for_chart(&apps, "nope").is_none());
+    }
+
+    #[test]
+    fn settled_only_when_synced_healthy_and_not_running() {
+        let settled = AppStatus {
+            sync: "Synced".into(),
+            health: "Healthy".into(),
+            phase: "Succeeded".into(),
+        };
+        assert!(settled.is_settled());
+
+        let running = AppStatus {
+            sync: "Synced".into(),
+            health: "Healthy".into(),
+            phase: "Running".into(),
+        };
+        assert!(!running.is_settled());
+
+        let out_of_sync = AppStatus {
+            sync: "OutOfSync".into(),
+            health: "Healthy".into(),
+            phase: String::new(),
+        };
+        assert!(!out_of_sync.is_settled());
+
+        let progressing = AppStatus {
+            sync: "Synced".into(),
+            health: "Progressing".into(),
+            phase: String::new(),
+        };
+        assert!(!progressing.is_settled());
     }
 }

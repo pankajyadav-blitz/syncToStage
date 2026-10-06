@@ -29,10 +29,11 @@ const STAGE: &str = "stage";
         sts -b      trigger this repo's Jenkins build only\n  \
         sts -j      show this repo's Jenkins jobs (-ja for all)\n  \
         sts -c      check Jenkins/ArgoCD config and credentials\n  \
-        sts -P      show builds waiting to be synced to ArgoCD\n\n\
+        sts -P      show builds waiting to be synced to ArgoCD\n  \
+        sts -S      show ArgoCD apps still syncing\n\n\
 After a build is triggered, a cron job (`sts --watch`, every minute) waits for it\n\
 to finish and, if it succeeded, syncs its ArgoCD app. Skip that with -A.",
-    group(ArgGroup::new("mode").required(true).args(["ship", "build", "jobs", "check", "pending", "watch"]))
+    group(ArgGroup::new("mode").required(true).args(["ship", "build", "jobs", "check", "pending", "watch", "sync_status"]))
 )]
 struct Cli {
     /// Ship: reset stage to origin/stage, merge your branch, push, trigger Jenkins
@@ -53,6 +54,9 @@ struct Cli {
     /// Run one deploy-watcher tick (what the cron job runs)
     #[arg(short = 'W', long)]
     watch: bool,
+    /// Watch ArgoCD apps still syncing, refreshing until each is Synced + Healthy
+    #[arg(short = 'S', long = "sync-status")]
+    sync_status: bool,
 
     /// Don't ask for confirmation
     #[arg(short = 'y', long)]
@@ -61,16 +65,16 @@ struct Cli {
     #[arg(short = 'd', long)]
     dry_run: bool,
     /// With -s: push to stage but don't trigger Jenkins
-    #[arg(short = 'n', long, conflicts_with_all = ["build", "jobs", "check", "pending", "watch"])]
+    #[arg(short = 'n', long, conflicts_with_all = ["build", "jobs", "check", "pending", "watch", "sync_status"])]
     no_build: bool,
     /// With -s/-b: don't sync ArgoCD after the build finishes
-    #[arg(short = 'A', long, conflicts_with_all = ["jobs", "check", "pending", "watch"])]
+    #[arg(short = 'A', long, conflicts_with_all = ["jobs", "check", "pending", "watch", "sync_status"])]
     no_argo: bool,
     /// With -s: also push your branch to origin before merging
-    #[arg(short = 'p', long, conflicts_with_all = ["build", "jobs", "check", "pending", "watch"])]
+    #[arg(short = 'p', long, conflicts_with_all = ["build", "jobs", "check", "pending", "watch", "sync_status"])]
     push_branch: bool,
     /// With -s: branch to merge into stage (default: the current branch)
-    #[arg(short = 'f', long, value_name = "BRANCH", conflicts_with_all = ["build", "jobs", "check", "pending", "watch"])]
+    #[arg(short = 'f', long, value_name = "BRANCH", conflicts_with_all = ["build", "jobs", "check", "pending", "watch", "sync_status"])]
     from: Option<String>,
     /// GitHub repo as owner/name for the job lookup (default: from the origin remote)
     #[arg(short = 'r', long, value_name = "OWNER/NAME")]
@@ -79,7 +83,7 @@ struct Cli {
     #[arg(short = 'w', long, value_name = "SECS", default_value_t = 15)]
     wait: u64,
     /// With -j: list every mapped repo
-    #[arg(short = 'a', long, conflicts_with_all = ["ship", "build", "check", "pending", "watch"])]
+    #[arg(short = 'a', long, conflicts_with_all = ["ship", "build", "check", "pending", "watch", "sync_status"])]
     all: bool,
 }
 
@@ -125,6 +129,8 @@ fn main() {
         list_jobs(cli.repo, cli.all)
     } else if cli.pending {
         deploy::show()
+    } else if cli.sync_status {
+        deploy::sync_status()
     } else if cli.watch {
         deploy::watch_loop()
     } else {

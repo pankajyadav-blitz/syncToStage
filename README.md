@@ -39,6 +39,15 @@ entry (tagged `# sts-watch`) runs `sts --watch` every minute. Each run:
 When nothing is pending, the crontab entry removes itself. `sts -P` shows the queue;
 the log is `~/.local/state/sts/watch.log`.
 
+Firing the sync only starts it; ArgoCD then rolls out in the background. Each app the
+watcher syncs is recorded in `~/.local/state/sts/syncing.json`, and `sts -S` shows the
+ones still in progress with their sync/health (e.g. `OutOfSync/Progressing`). On a
+terminal it stays up and refreshes in place every few seconds, dropping each app as it
+reaches `Synced` + `Healthy` (or stops existing), and exits by itself once the list is
+empty — no need to re-run it. Piped or redirected it prints a single snapshot instead.
+Only syncs this tool triggered are tracked, and an app that never settles is dropped
+after 30 minutes.
+
 If you run `sts -s` while on `stage` itself, it pulls `origin/stage` into your local
 `stage`, pushes it back to `origin/stage` and triggers Jenkins. If the pull
 conflicts, it is aborted and nothing is pushed.
@@ -61,6 +70,7 @@ Short flags combine: `-sy`, `-sd`, `-sny`, `-ja`.
 | `-j, --jobs` | show this repo's Jenkins jobs (`-ja` for every repo) |
 | `-c, --check` | test the Jenkins and ArgoCD config and credentials |
 | `-P, --pending` | show builds waiting to be synced to ArgoCD |
+| `-S, --sync-status` | show ArgoCD apps still syncing (drops each once Synced + Healthy) |
 | `-W, --watch` | run one watcher tick (what cron runs) |
 
 | option | |
