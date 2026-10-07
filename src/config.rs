@@ -42,9 +42,27 @@ struct FileConfig {
     crumb: Option<String>,
     argocd_url: Option<String>,
     argocd_token: Option<String>,
+    /// Repo slug (`owner/name`) used when `sts` can't find one from the cwd.
+    default_repo: Option<String>,
+    /// Slack-compatible incoming webhook; failures are POSTed here when set.
+    webhook_url: Option<String>,
 }
 
 pub const DEFAULT_ARGOCD_URL: &str = "https://argocd-stage-aws.sdloki.in";
+
+/// `default_repo` from the config file (or `STS_DEFAULT_REPO`), used when the
+/// current directory isn't a git repo with a recognizable remote.
+pub fn default_repo() -> Option<String> {
+    let file = read_file().unwrap_or_default();
+    pick("STS_DEFAULT_REPO", file.default_repo)
+}
+
+/// Slack-compatible incoming webhook for failure notifications, if configured
+/// (file `webhook_url` or `STS_WEBHOOK_URL`).
+pub fn webhook_url() -> Option<String> {
+    let file = read_file().unwrap_or_default();
+    pick("STS_WEBHOOK_URL", file.webhook_url)
+}
 
 #[derive(Debug, Clone)]
 pub struct ArgoConfig {

@@ -31,6 +31,39 @@ pub enum QueueState {
     Unknown,
 }
 
+/// How far a running build has got, for display in the pending view.
+pub struct BuildProgress {
+    /// Seconds since the build started.
+    pub elapsed: u64,
+    /// Jenkins' estimate of total build time in seconds, if known.
+    pub estimated: Option<u64>,
+}
+
+impl BuildProgress {
+    /// A short human hint like `1m20s/3m00s (~1m40s left)` or `45s elapsed`.
+    pub fn hint(&self) -> String {
+        match self.estimated {
+            Some(est) if est > self.elapsed => format!(
+                "{}/{} (~{} left)",
+                fmt_secs(self.elapsed),
+                fmt_secs(est),
+                fmt_secs(est - self.elapsed)
+            ),
+            Some(est) => format!("{}/{} (overdue)", fmt_secs(self.elapsed), fmt_secs(est)),
+            None => format!("{} elapsed", fmt_secs(self.elapsed)),
+        }
+    }
+}
+
+/// `90` -> `1m30s`, `45` -> `45s`.
+pub fn fmt_secs(s: u64) -> String {
+    if s >= 60 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
 impl Jenkins {
     pub fn new(cfg: JenkinsConfig) -> Jenkins {
         let agent: Agent = Agent::config_builder()
@@ -180,6 +213,35 @@ impl Jenkins {
             return Ok(None);
         }
         Ok(Some(v["result"].as_str().unwrap_or("UNKNOWN").to_string()))
+    }
+
+    /// Progress of a running build: how long it has run and Jenkins' estimate of
+    /// how long it should take, both in seconds. `None` if either is unavailable.
+    /// Used only for display, so any error degrades to `None`.
+    pub fn build_progress(&self, build_url: &str) -> Option<BuildProgress> {
+        let api = format!(
+            "{}/api/json?tree=timestamp,estimatedDuration,building",
+            build_url.trim_end_matches('/')
+        );
+        let mut resp = self.get(&api).ok()?;
+        if resp.status().as_u16() != 200 {
+            return None;
+        }
+        let body = resp.body_mut().read_to_string().ok()?;
+        let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+        let start_ms = v["timestamp"].as_i64()?;
+        let est_ms = v["estimatedDuration"].as_i64().unwrap_or(-1);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as i64;
+        let elapsed = ((now_ms - start_ms).max(0) / 1000) as u64;
+        let estimated = if est_ms > 0 {
+            Some((est_ms / 1000) as u64)
+        } else {
+            None
+        };
+        Some(BuildProgress { elapsed, estimated })
     }
 
     pub fn console_text(&self, build_url: &str) -> Result<String> {

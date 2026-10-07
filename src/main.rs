@@ -2,11 +2,14 @@ mod argocd;
 mod config;
 mod deploy;
 mod git;
+mod history;
 mod jenkins;
 mod jobs;
+mod notify;
 
 use anyhow::{Context, Result, bail};
-use clap::{ArgGroup, Parser};
+use clap::{ArgGroup, CommandFactory, Parser};
+use clap_complete::Shell;
 use jenkins::Jenkins;
 use jobs::{Job, JobMap};
 use std::io::{BufRead, IsTerminal, Write};
@@ -22,18 +25,27 @@ const STAGE: &str = "stage";
     version,
     about = "Merge your branch into stage, push it, and trigger the Jenkins stage build",
     after_help = "Examples:\n  \
+        sts          live dashboard: builds + ArgoCD syncs in progress\n  \
         sts -s      ship: merge current branch into stage, push, build (asks first)\n  \
         sts -sy     same, no confirmation\n  \
-        sts -sd     dry run: show what -s would do\n  \
+        sts -sd     dry run: show what -s would do (with a diff summary)\n  \
         sts -sn     ship without triggering Jenkins\n  \
+        sts -sF     ship, then follow the build + sync to completion\n  \
         sts -b      trigger this repo's Jenkins build only\n  \
         sts -j      show this repo's Jenkins jobs (-ja for all)\n  \
         sts -c      check Jenkins/ArgoCD config and credentials\n  \
         sts -P      show builds waiting to be synced to ArgoCD\n  \
-        sts -S      show ArgoCD apps still syncing\n\n\
+        sts -S      show ArgoCD apps still syncing\n  \
+        sts -L      tail the watch log\n  \
+        sts -H      show recent deploy history\n  \
+        sts --retry <repo>       re-trigger a dropped build\n  \
+        sts --completions bash   print shell completions\n\n\
 After a build is triggered, a cron job (`sts --watch`, every minute) waits for it\n\
 to finish and, if it succeeded, syncs its ArgoCD app. Skip that with -A.",
-    group(ArgGroup::new("mode").required(true).args(["ship", "build", "jobs", "check", "pending", "watch", "sync_status"]))
+    group(ArgGroup::new("mode").required(false).args([
+        "ship", "build", "jobs", "check", "pending", "watch", "sync_status",
+        "dashboard", "log", "history", "retry", "completions",
+    ]))
 )]
 struct Cli {
     /// Ship: reset stage to origin/stage, merge your branch, push, trigger Jenkins
@@ -57,6 +69,21 @@ struct Cli {
     /// Watch ArgoCD apps still syncing, refreshing until each is Synced + Healthy
     #[arg(short = 'S', long = "sync-status")]
     sync_status: bool,
+    /// Combined live dashboard of builds + ArgoCD syncs (the default with no mode)
+    #[arg(short = 'D', long)]
+    dashboard: bool,
+    /// Tail the deploy-watcher log
+    #[arg(short = 'L', long)]
+    log: bool,
+    /// Show recent deploy history (optionally filtered by the -r repo)
+    #[arg(short = 'H', long)]
+    history: bool,
+    /// Re-trigger a dropped build for a repo (owner/name)
+    #[arg(long, value_name = "OWNER/NAME")]
+    retry: Option<String>,
+    /// Print shell completions for the given shell and exit
+    #[arg(long, value_name = "SHELL")]
+    completions: Option<Shell>,
 
     /// Don't ask for confirmation
     #[arg(short = 'y', long)]
@@ -64,6 +91,9 @@ struct Cli {
     /// Show what would happen; don't merge, push or build
     #[arg(short = 'd', long)]
     dry_run: bool,
+    /// With -s/-b: block and follow the build + ArgoCD sync to completion
+    #[arg(short = 'F', long)]
+    follow: bool,
     /// With -s: push to stage but don't trigger Jenkins
     #[arg(short = 'n', long, conflicts_with_all = ["build", "jobs", "check", "pending", "watch", "sync_status"])]
     no_build: bool,
@@ -96,6 +126,7 @@ struct ShipArgs {
     dry_run: bool,
     yes: bool,
     wait: u64,
+    follow: bool,
 }
 
 struct BuildArgs {
@@ -103,11 +134,23 @@ struct BuildArgs {
     no_argo: bool,
     dry_run: bool,
     wait: u64,
+    follow: bool,
 }
 
 fn main() {
     let cli = Cli::parse();
-    let result = if cli.ship {
+    let result = if let Some(shell) = cli.completions {
+        print_completions(shell);
+        Ok(())
+    } else if let Some(repo) = cli.retry {
+        build(BuildArgs {
+            repo: Some(repo),
+            no_argo: cli.no_argo,
+            dry_run: cli.dry_run,
+            wait: cli.wait,
+            follow: cli.follow,
+        })
+    } else if cli.ship {
         ship(ShipArgs {
             from: cli.from,
             repo: cli.repo,
@@ -117,6 +160,7 @@ fn main() {
             dry_run: cli.dry_run,
             yes: cli.yes,
             wait: cli.wait,
+            follow: cli.follow,
         })
     } else if cli.build {
         build(BuildArgs {
@@ -124,6 +168,7 @@ fn main() {
             no_argo: cli.no_argo,
             dry_run: cli.dry_run,
             wait: cli.wait,
+            follow: cli.follow,
         })
     } else if cli.jobs {
         list_jobs(cli.repo, cli.all)
@@ -133,13 +178,30 @@ fn main() {
         deploy::sync_status()
     } else if cli.watch {
         deploy::watch_loop()
-    } else {
+    } else if cli.log {
+        deploy::tail_log(200)
+    } else if cli.history {
+        history::show(cli.repo.as_deref())
+    } else if cli.dashboard {
+        deploy::dashboard()
+    } else if cli.check {
         check()
+    } else if cli.follow {
+        deploy::follow()
+    } else {
+        // Bare `sts`: the combined live dashboard.
+        deploy::dashboard()
     };
     if let Err(e) = result {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
+}
+
+fn print_completions(shell: Shell) {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
 }
 
 fn ship(a: ShipArgs) -> Result<()> {
@@ -176,8 +238,18 @@ fn ship(a: ShipArgs) -> Result<()> {
     )?;
     if incoming.is_empty() {
         println!("Nothing to merge: {remote_stage} already contains `{source}`.");
-        println!("To rebuild stage anyway, run `sts -b`.");
-        return Ok(());
+        if a.no_build {
+            println!("Nothing to build (-n); stage is already up to date.");
+            return Ok(());
+        }
+        if a.dry_run {
+            println!("Dry run: stage is up to date; would trigger the Jenkins build.");
+            print_jenkins_plan(&slug, &jobs, a.no_build);
+            print_argo_plan(&jobs, a.no_build, a.no_argo, argo);
+            return Ok(());
+        }
+        println!("Triggering the Jenkins build to rebuild stage anyway.");
+        return finish_build(&slug, jobs, jenkins, a.no_build, argo, a.wait, a.follow);
     }
 
     // Summary of what is about to happen.
@@ -186,6 +258,7 @@ fn ship(a: ShipArgs) -> Result<()> {
     println!("  merge     {source} ({})", short(&source_sha));
     println!("  into      {remote_stage} ({})", short(&remote_stage_sha));
     print_commits(&incoming);
+    print_diff_summary(&repo_dir, &remote_stage, &format!("refs/heads/{source}"));
     warn_local_stage(&repo_dir, &remote_stage, &remote_stage_sha)?;
     let dirty = git::run(
         &repo_dir,
@@ -221,7 +294,7 @@ fn ship(a: ShipArgs) -> Result<()> {
     println!("Pushed {STAGE} at {}", short(&pushed));
     update_local_stage(&repo_dir, &pushed);
 
-    finish_build(&slug, jobs, jenkins, a.no_build, argo, a.wait)
+    finish_build(&slug, jobs, jenkins, a.no_build, argo, a.wait, a.follow)
 }
 
 /// Shipping from `stage` itself: pull origin/stage into the checked-out local
@@ -277,7 +350,7 @@ fn ship_stage(a: ShipArgs, repo_dir: &Path) -> Result<()> {
     }
 
     pull_and_push_stage(repo_dir, &remote_stage)?;
-    finish_build(&slug, jobs, jenkins, a.no_build, argo, a.wait)
+    finish_build(&slug, jobs, jenkins, a.no_build, argo, a.wait, a.follow)
 }
 
 /// Merges origin/stage into the checked-out local stage and pushes it.
@@ -395,13 +468,14 @@ fn finish_build(
     no_build: bool,
     argo: bool,
     wait: u64,
+    follow: bool,
 ) -> Result<()> {
     if no_build {
         println!("Pushed to {STAGE}; build not triggered (-n).");
         return Ok(());
     }
     match (jobs, jenkins) {
-        (Some(jobs), Some(jenkins)) => trigger_all(&jenkins, slug, &jobs, argo, wait),
+        (Some(jobs), Some(jenkins)) => trigger_all(&jenkins, slug, &jobs, argo, wait, follow),
         _ => {
             println!(
                 "Pushed to {STAGE}, but no Jenkins job is mapped for {slug}; build not triggered."
@@ -498,7 +572,10 @@ fn merge_and_push(repo_dir: &Path, source: &str, remote_stage: &str) -> Result<S
 fn build(a: BuildArgs) -> Result<()> {
     let slug = match a.repo {
         Some(r) => r,
-        None => resolve_slug(&repo_root()?, None)?,
+        None => match repo_root() {
+            Ok(dir) => resolve_slug(&dir, None)?,
+            Err(e) => config::default_repo().ok_or(e)?,
+        },
     };
     let map = JobMap::load()?;
     let Some(jobs) = map.lookup(&slug) else {
@@ -520,10 +597,17 @@ fn build(a: BuildArgs) -> Result<()> {
     }
     let jenkins = connect()?;
     let argo = !a.no_argo && argo_configured()?;
-    trigger_all(&jenkins, &slug, &jobs, argo, a.wait)
+    trigger_all(&jenkins, &slug, &jobs, argo, a.wait, a.follow)
 }
 
-fn trigger_all(jenkins: &Jenkins, slug: &str, jobs: &[Job], argo: bool, wait: u64) -> Result<()> {
+fn trigger_all(
+    jenkins: &Jenkins,
+    slug: &str,
+    jobs: &[Job],
+    argo: bool,
+    wait: u64,
+    follow: bool,
+) -> Result<()> {
     step(&format!("Triggering {} Jenkins job(s)", jobs.len()));
     let mut queued = Vec::new();
     let mut failed = 0;
@@ -568,7 +652,8 @@ fn trigger_all(jenkins: &Jenkins, slug: &str, jobs: &[Job], argo: bool, wait: u6
         }
     }
 
-    if argo && !pending.is_empty() {
+    let scheduled = argo && !pending.is_empty();
+    if scheduled {
         match deploy::enqueue(pending) {
             Ok(()) => println!(
                 "ArgoCD sync scheduled: cron checks every minute and syncs when the build succeeds \
@@ -582,9 +667,17 @@ fn trigger_all(jenkins: &Jenkins, slug: &str, jobs: &[Job], argo: bool, wait: u6
     if failed > 0 {
         bail!(
             "{failed} of {} Jenkins trigger(s) failed (anything already pushed stays pushed); \
-             retry with `sts -b`",
+             retry with `sts --retry {slug}`",
             jobs.len()
         );
+    }
+
+    // -F/--follow: block here and watch the build + sync through to completion
+    // instead of handing off to cron. Only meaningful when a sync was scheduled.
+    if follow && scheduled {
+        println!();
+        step("Following the build + ArgoCD sync (Ctrl-C to detach; cron keeps watching)");
+        deploy::follow()?;
     }
     Ok(())
 }
@@ -655,7 +748,10 @@ fn repo_root() -> Result<PathBuf> {
 fn resolve_slug(repo_dir: &Path, explicit: Option<String>) -> Result<String> {
     match explicit {
         Some(r) => Ok(r),
-        None => git::repo_slug(repo_dir, REMOTE),
+        None => match git::repo_slug(repo_dir, REMOTE) {
+            Ok(slug) => Ok(slug),
+            Err(e) => config::default_repo().ok_or(e),
+        },
     }
 }
 
@@ -720,6 +816,21 @@ fn print_commits(log: &str) {
     }
     if lines.len() > SHOW {
         println!("              ... and {} more", lines.len() - SHOW);
+    }
+}
+
+/// A one-line diff summary (files changed, insertions, deletions) for what the
+/// merge would bring onto stage, from `git diff --shortstat base...tip`. The
+/// three-dot range diffs tip against the merge base, matching what will land.
+/// Best-effort: silent on error.
+fn print_diff_summary(repo_dir: &Path, base: &str, tip: &str) {
+    let range = format!("{base}...{tip}");
+    if let Ok(stat) = git::run(repo_dir, &["diff", "--shortstat", &range]) {
+        let stat = stat.trim();
+        if !stat.is_empty() {
+            // e.g. "8 files changed, 312 insertions(+), 45 deletions(-)"
+            println!("  diff      {stat}");
+        }
     }
 }
 

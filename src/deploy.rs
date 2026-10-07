@@ -7,7 +7,9 @@
 
 use crate::argocd::{self, App, Argo, SyncOutcome};
 use crate::config;
+use crate::history;
 use crate::jenkins::{Jenkins, QueueState};
+use crate::notify;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -28,6 +30,13 @@ const MAX_SYNC_ATTEMPTS: u32 = 3;
 const WATCH_INTERVAL_SECS: u64 = 10;
 /// How often `sts -S` refreshes the live sync view on a terminal.
 const SYNC_POLL_SECS: u64 = 5;
+/// How often `sts -P` refreshes the live pending view on a terminal.
+const PENDING_POLL_SECS: u64 = 5;
+/// How often `sts --follow` advances and redraws the pipeline.
+const FOLLOW_POLL_SECS: u64 = 5;
+/// Trim `watch.log` once it grows past this, keeping the most recent lines.
+const LOG_MAX_BYTES: u64 = 1 << 20; // 1 MiB
+const LOG_KEEP_LINES: usize = 2000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pending {
@@ -133,12 +142,7 @@ impl Queue {
     }
 
     fn save(&self) -> Result<()> {
-        let path = queue_file();
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(&self.items)?)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        save_items(&queue_file(), &self.items)
     }
 
     /// Cheap, lock-free check used by the watch loop to stop early once the
@@ -201,12 +205,18 @@ impl SyncQueue {
     }
 
     fn save(&self) -> Result<()> {
-        let path = syncing_file();
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(&self.items)?)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        save_items(&syncing_file(), &self.items)
+    }
+
+    /// Lock-free check: is the syncing list empty? Missing/empty file counts as yes.
+    fn is_empty_now() -> bool {
+        match fs::read_to_string(syncing_file()) {
+            Ok(text) => match serde_json::from_str::<Vec<Syncing>>(&text) {
+                Ok(items) => items.is_empty(),
+                Err(_) => text.trim().is_empty(),
+            },
+            Err(_) => true,
+        }
     }
 }
 
@@ -240,8 +250,27 @@ pub fn enqueue(entries: Vec<Pending>) -> Result<()> {
     install_cron()
 }
 
-/// `sts --pending`
+/// `sts --pending`: show the builds waiting to be synced to ArgoCD. On a
+/// terminal it refreshes in place every few seconds (dropping each build as the
+/// cron watcher deploys it) and exits once the queue is empty; piped or
+/// redirected it prints a single snapshot and exits.
 pub fn show() -> Result<()> {
+    let live = std::io::stdout().is_terminal();
+    loop {
+        if live {
+            clear_screen();
+            println!("sts -P  —  {}  (Ctrl-C to stop)", utc_now());
+        }
+        let empty = show_once()?;
+        if empty || !live {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(PENDING_POLL_SECS));
+    }
+}
+
+/// One pass of the pending view. Returns true when the queue is empty.
+fn show_once() -> Result<bool> {
     let q = Queue::open()?;
     let cron = cron_installed().unwrap_or(false);
     println!("queue:   {}", queue_file().display());
@@ -252,21 +281,105 @@ pub fn show() -> Result<()> {
     );
     if q.items.is_empty() {
         println!("No builds waiting to be deployed.");
-        return Ok(());
+        return Ok(true);
     }
     let t = now();
+    // Only build a Jenkins client (and poll progress) when something is
+    // actually building, so a queue of not-yet-started items stays cheap.
+    let jenkins = if q.items.iter().any(|p| p.build_url.is_some()) {
+        config::load().ok().map(Jenkins::new)
+    } else {
+        None
+    };
     for p in &q.items {
         let state = if p.build_url.is_some() {
             "building"
         } else {
             "queued"
         };
+        let progress = match (&p.build_url, &jenkins) {
+            (Some(url), Some(j)) => j
+                .build_progress(url)
+                .map(|pr| format!(", {}", pr.hint()))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
         println!(
-            "  {state:<9} {}  ({}m ago, {})",
+            "  {state:<9} {}  ({}s ago, {}{progress})",
             p.label(),
-            t.saturating_sub(p.queued_at) / 60,
+            t.saturating_sub(p.queued_at),
             p.repo
         );
+    }
+    Ok(false)
+}
+
+/// `sts` with no mode flag, or `sts --dashboard`: a combined live view of the
+/// whole pipeline — builds waiting/running (from `-P`) and ArgoCD apps still
+/// syncing (from `-S`) — in one auto-refreshing screen. On a terminal it
+/// refreshes until both are empty; piped it prints a single snapshot.
+pub fn dashboard() -> Result<()> {
+    let live = std::io::stdout().is_terminal();
+    loop {
+        if live {
+            clear_screen();
+            println!("sts dashboard  —  {}  (Ctrl-C to stop)", utc_now());
+        }
+        println!("── builds ──────────────────────────────────");
+        let builds_empty = show_once()?;
+        println!("── argocd ──────────────────────────────────");
+        let syncs_empty = sync_status_once()?;
+        if (builds_empty && syncs_empty) || !live {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(PENDING_POLL_SECS));
+    }
+}
+
+/// Block until the given repo's builds (and the syncs they trigger) finish,
+/// printing the combined dashboard as it goes. Used by `sts -s --follow` after
+/// a build is triggered, and by `sts --follow` on its own. Runs watcher ticks
+/// inline so it works even if cron hasn't fired yet. Returns when both queues
+/// are empty.
+pub fn follow() -> Result<()> {
+    let live = std::io::stdout().is_terminal();
+    loop {
+        // Advance the pipeline ourselves rather than waiting on cron.
+        tick()?;
+        if let Err(e) = check_syncing(SyncMode::Notify) {
+            log(&format!("sync check failed: {e:#}"));
+        }
+        if live {
+            clear_screen();
+            println!("sts --follow  —  {}  (Ctrl-C to stop)", utc_now());
+        }
+        println!("── builds ──────────────────────────────────");
+        let builds_empty = show_once()?;
+        println!("── argocd ──────────────────────────────────");
+        let syncs_empty = sync_status_once()?;
+        if builds_empty && syncs_empty {
+            println!("\nAll builds deployed and synced.");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(FOLLOW_POLL_SECS));
+    }
+}
+
+/// `sts --log`: print the last `n` lines of the watch log.
+pub fn tail_log(n: usize) -> Result<()> {
+    let path = log_file();
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("No watch log yet ({}).", path.display());
+            return Ok(());
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    for line in &lines[start..] {
+        println!("{line}");
     }
     Ok(())
 }
@@ -295,17 +408,44 @@ pub fn sync_status() -> Result<()> {
 /// released as soon as this returns, so the cron watcher can enqueue new syncs
 /// between polls.
 fn sync_status_once() -> Result<bool> {
+    check_syncing(SyncMode::Print)
+}
+
+/// Whether a syncing-list pass should print to stdout (interactive `sts -S`) or
+/// fire desktop/webhook notifications (the background cron watcher).
+#[derive(Clone, Copy, PartialEq)]
+enum SyncMode {
+    /// `sts -S`: print each app's live status; no notifications.
+    Print,
+    /// cron `--watch`: silent, but notify + record history as apps settle or fail.
+    Notify,
+}
+
+/// Shared core for both the interactive `sts -S` view and the cron watcher's
+/// sync-completion check. Polls each tracked app, prunes the ones that have
+/// settled (or vanished, or timed out), and in `Notify` mode fires a
+/// notification and records history for each terminal outcome. Returns true
+/// when nothing is left to track.
+fn check_syncing(mode: SyncMode) -> Result<bool> {
+    let print = mode == SyncMode::Print;
+    let notify = mode == SyncMode::Notify;
     let mut q = SyncQueue::open()?;
-    println!("tracking: {}", syncing_file().display());
+    if print {
+        println!("tracking: {}", syncing_file().display());
+    }
     if q.items.is_empty() {
-        println!("No ArgoCD syncs in progress.");
+        if print {
+            println!("No ArgoCD syncs in progress.");
+        }
         return Ok(true);
     }
 
     let Some(argo_cfg) = config::load_argo()? else {
-        println!(
-            "no ArgoCD token configured (argocd_token in config.toml); can't check sync status"
-        );
+        if print {
+            println!(
+                "no ArgoCD token configured (argocd_token in config.toml); can't check sync status"
+            );
+        }
         // Can't make progress without a token; treat as done so we don't spin.
         return Ok(true);
     };
@@ -322,12 +462,45 @@ fn sync_status_once() -> Result<bool> {
                 s.app,
                 MAX_AGE_SECS / 60
             ));
+            if notify {
+                record_history(&s.repo, "SYNC_GAVE_UP", &s.app);
+                notify::send(
+                    notify::Level::Failure,
+                    &format!("sts: sync stuck ({})", s.repo),
+                    &format!("{} not settled after {}m", s.app, MAX_AGE_SECS / 60),
+                );
+            }
             continue;
         }
         match argo.status(&s.app) {
-            Ok(None) => done.push(format!("  gone      {}  (no such ArgoCD app)", s.app)),
+            Ok(None) => {
+                done.push(format!("  gone      {}  (no such ArgoCD app)", s.app));
+                if notify {
+                    record_history(&s.repo, "APP_GONE", &s.app);
+                }
+            }
             Ok(Some(st)) if st.is_settled() => {
-                done.push(format!("  synced    {}  ({})", s.app, st.health))
+                done.push(format!("  synced    {}  ({})", s.app, st.health));
+                if notify {
+                    record_history(&s.repo, "SYNCED", &s.app);
+                    notify::send(
+                        notify::Level::Info,
+                        &format!("sts: deployed ({})", s.repo),
+                        &format!("{} is now Synced + {}", s.app, st.health),
+                    );
+                }
+            }
+            Ok(Some(st)) if st.health == "Degraded" => {
+                // A degraded app won't settle on its own; surface it and drop it.
+                done.push(format!("  degraded  {}  ({}/{})", s.app, st.sync, st.health));
+                if notify {
+                    record_history(&s.repo, "DEGRADED", &s.app);
+                    notify::send(
+                        notify::Level::Failure,
+                        &format!("sts: app degraded ({})", s.repo),
+                        &format!("{} is {}/{} after sync", s.app, st.sync, st.health),
+                    );
+                }
             }
             Ok(Some(st)) => {
                 let phase = if st.phase.is_empty() {
@@ -335,19 +508,23 @@ fn sync_status_once() -> Result<bool> {
                 } else {
                     format!(", {}", st.phase)
                 };
-                println!(
-                    "  syncing   {:<28} {}/{}{phase}  ({}m ago, {})",
-                    s.app,
-                    st.sync,
-                    st.health,
-                    t.saturating_sub(s.started_at) / 60,
-                    s.repo,
-                );
+                if print {
+                    println!(
+                        "  syncing   {:<28} {}/{}{phase}  ({}s ago, {})",
+                        s.app,
+                        st.sync,
+                        st.health,
+                        t.saturating_sub(s.started_at),
+                        s.repo,
+                    );
+                }
                 keep.push(s);
             }
             Err(e) => {
                 // Keep it; a transient error shouldn't lose the entry.
-                println!("  ?         {}  (status check failed: {e:#})", s.app);
+                if print {
+                    println!("  ?         {}  (status check failed: {e:#})", s.app);
+                }
                 keep.push(s);
             }
         }
@@ -356,13 +533,15 @@ fn sync_status_once() -> Result<bool> {
     q.items = keep;
     q.save()?;
 
-    if !done.is_empty() {
+    if print && !done.is_empty() {
         for line in &done {
             println!("{line}");
         }
     }
     if q.items.is_empty() {
-        println!("All tracked ArgoCD syncs have settled.");
+        if print {
+            println!("All tracked ArgoCD syncs have settled.");
+        }
         return Ok(true);
     }
     Ok(false)
@@ -370,12 +549,20 @@ fn sync_status_once() -> Result<bool> {
 
 /// What cron runs: polls every `WATCH_INTERVAL_SECS` for one minute by looping
 /// `tick()` internally, since a crontab can't fire more than once a minute.
-/// Stops early (and lets the entry remove itself) once the queue is empty.
+/// Stops early (and lets the entry remove itself) once both the pending build
+/// queue and the syncing list are empty.
 pub fn watch_loop() -> Result<()> {
+    trim_log();
     let runs = (60 / WATCH_INTERVAL_SECS).max(1);
     for i in 0..runs {
         tick()?;
-        if Queue::is_empty_now() {
+        // Also advance tracked ArgoCD syncs so a "deployed" (or failed) notice
+        // fires even when nobody is running `sts -S`.
+        if let Err(e) = check_syncing(SyncMode::Notify) {
+            log(&format!("sync check failed: {e:#}"));
+        }
+        if Queue::is_empty_now() && SyncQueue::is_empty_now() {
+            remove_cron()?;
             break;
         }
         if i + 1 < runs {
@@ -391,7 +578,10 @@ pub fn tick() -> Result<()> {
         return Ok(()); // previous tick still running
     };
     if q.items.is_empty() {
-        return remove_cron();
+        // No builds to watch, but keep the watcher alive while apps are still
+        // syncing so their completion is tracked; watch_loop removes the cron
+        // entry once both queues are empty.
+        return Ok(());
     }
 
     let jenkins = Jenkins::new(config::load()?);
@@ -412,6 +602,12 @@ pub fn tick() -> Result<()> {
                 p.label(),
                 MAX_AGE_SECS / 60
             ));
+            record_history(&p.repo, "GAVE_UP", &p.label());
+            notify::send(
+                notify::Level::Failure,
+                &format!("sts: gave up on {}", p.repo),
+                &format!("build not deployed after {}m: {}", MAX_AGE_SECS / 60, p.label()),
+            );
             continue;
         }
 
@@ -429,6 +625,12 @@ pub fn tick() -> Result<()> {
                         "{}: cancelled in the Jenkins queue, not deploying",
                         p.job_url
                     ));
+                    record_history(&p.repo, "CANCELLED", &p.job_url);
+                    notify::send(
+                        notify::Level::Failure,
+                        &format!("sts: build cancelled ({})", p.repo),
+                        &format!("cancelled in the Jenkins queue: {}", p.job_url),
+                    );
                     continue;
                 }
                 QueueState::Gone => {
@@ -436,6 +638,12 @@ pub fn tick() -> Result<()> {
                         "{}: queue item {queue_url} expired before its build was seen; not deploying",
                         p.job_url
                     ));
+                    record_history(&p.repo, "LOST", &p.job_url);
+                    notify::send(
+                        notify::Level::Failure,
+                        &format!("sts: build lost ({})", p.repo),
+                        &format!("queue item expired before the build was seen: {}", p.job_url),
+                    );
                     continue;
                 }
                 QueueState::Waiting | QueueState::Unknown => {
@@ -449,6 +657,13 @@ pub fn tick() -> Result<()> {
         match jenkins.build_result(&build_url) {
             Ok(None) => keep.push(p), // still running
             Ok(Some(r)) if r == "SUCCESS" => {
+                // Build finished OK; moving on to the ArgoCD sync.
+                log(&format!("{build_url}: build SUCCESS, syncing ArgoCD"));
+                notify::send(
+                    notify::Level::Info,
+                    &format!("sts: build succeeded ({})", p.repo),
+                    &format!("syncing ArgoCD now: {build_url}"),
+                );
                 if apps.is_none() {
                     match argo.apps() {
                         Ok(a) => apps = Some(a),
@@ -474,11 +689,25 @@ pub fn tick() -> Result<()> {
                                 "{build_url}: deploy failed {} times, giving up: {e:#}",
                                 p.attempts
                             ));
+                            record_history(&p.repo, "SYNC_FAILED", &build_url);
+                            notify::send(
+                                notify::Level::Failure,
+                                &format!("sts: ArgoCD sync failed ({})", p.repo),
+                                &format!("gave up after {} attempts: {e:#}", p.attempts),
+                            );
                         }
                     }
                 }
             }
-            Ok(Some(r)) => log(&format!("{build_url}: build finished {r}, not deploying")),
+            Ok(Some(r)) => {
+                log(&format!("{build_url}: build finished {r}, not deploying"));
+                record_history(&p.repo, &r, &build_url);
+                notify::send(
+                    notify::Level::Failure,
+                    &format!("sts: build {r} ({})", p.repo),
+                    &format!("not deploying: {build_url}"),
+                );
+            }
             Err(e) => {
                 log(&format!("{build_url}: status check failed: {e:#}"));
                 keep.push(p);
@@ -488,7 +717,10 @@ pub fn tick() -> Result<()> {
 
     q.items = keep;
     q.save()?;
-    if q.items.is_empty() {
+    // Drop the lock before touching cron. Only stop the watcher when there are
+    // neither builds left to watch nor apps left to track.
+    drop(q);
+    if Queue::is_empty_now() && SyncQueue::is_empty_now() {
         remove_cron()?;
     }
     Ok(())
@@ -570,6 +802,55 @@ fn deploy(jenkins: &Jenkins, argo: &Argo, apps: &[App], p: &Pending) -> Result<(
 
 fn log(msg: &str) {
     println!("{} {msg}", utc_now());
+}
+
+/// Append a deploy outcome to the history log, logging (not failing) on error.
+fn record_history(repo: &str, result: &str, detail: &str) {
+    if let Err(e) = history::record(repo, result, detail) {
+        log(&format!("could not record history for {repo}: {e:#}"));
+    }
+}
+
+/// Keep `watch.log` from growing without bound. cron appends to it via shell
+/// redirection, so once it passes `LOG_MAX_BYTES` we rewrite it with just the
+/// most recent lines. Best-effort: any error here is ignored.
+fn trim_log() {
+    let path = log_file();
+    let Ok(meta) = fs::metadata(&path) else {
+        return;
+    };
+    if meta.len() <= LOG_MAX_BYTES {
+        return;
+    }
+    let Ok(text) = fs::read_to_string(&path) else {
+        return;
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let keep = lines.len().min(LOG_KEEP_LINES);
+    let tail = lines[lines.len() - keep..].join("\n");
+    let tmp = path.with_extension("log.tmp");
+    if fs::write(&tmp, format!("{tail}\n")).is_ok() {
+        let _ = fs::rename(&tmp, &path);
+    }
+}
+
+/// Writes a queue atomically, or removes the file when the list is empty so the
+/// state dir doesn't keep a stale `[]` around once a trace completes. A missing
+/// file is already treated as an empty queue everywhere it is read.
+fn save_items<T: Serialize>(path: &std::path::Path, items: &[T]) -> Result<()> {
+    if items.is_empty() {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        }
+    } else {
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_string_pretty(items)?)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
 }
 
 /// Clear the terminal and move the cursor home, so the live `sts -S` view
@@ -722,5 +1003,24 @@ mod tests {
     #[test]
     fn quotes_for_shell() {
         assert_eq!(sh_quote("/a b/it's"), r"'/a b/it'\''s'");
+    }
+
+    #[test]
+    fn save_items_writes_then_removes_when_empty() {
+        let dir = std::env::temp_dir().join(format!("sts-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("q.json");
+
+        let items = vec![Pending::new("r", "/job/x/build", "", None, None)];
+        save_items(&path, &items).unwrap();
+        assert!(path.exists(), "non-empty queue should be written");
+
+        save_items::<Pending>(&path, &[]).unwrap();
+        assert!(!path.exists(), "empty queue should remove the file");
+
+        // Removing an already-missing file is a no-op, not an error.
+        save_items::<Pending>(&path, &[]).unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
