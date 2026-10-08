@@ -36,6 +36,7 @@ const STAGE: &str = "stage";
         sts -c      check Jenkins/ArgoCD config and credentials\n  \
         sts -P      show builds waiting to be synced to ArgoCD\n  \
         sts -S      show ArgoCD apps still syncing\n  \
+        sts -l <app> tail an ArgoCD app's container logs (-N <namespace> to pick one)\n  \
         sts -L      tail the watch log\n  \
         sts -H      show recent deploy history\n  \
         sts --retry <repo>       re-trigger a dropped build\n  \
@@ -44,7 +45,7 @@ After a build is triggered, a cron job (`sts --watch`, every minute) waits for i
 to finish and, if it succeeded, syncs its ArgoCD app. Skip that with -A.",
     group(ArgGroup::new("mode").required(false).args([
         "ship", "build", "jobs", "check", "pending", "watch", "sync_status",
-        "dashboard", "log", "history", "retry", "completions",
+        "dashboard", "log", "logs", "history", "retry", "completions",
     ]))
 )]
 struct Cli {
@@ -78,6 +79,16 @@ struct Cli {
     /// Show recent deploy history (optionally filtered by the -r repo)
     #[arg(short = 'H', long)]
     history: bool,
+    /// Tail an ArgoCD app's container logs; the app is optional (auto-detected
+    /// from the current repo's Jenkins job when omitted). E.g. -l soochi-dash-app-test
+    #[arg(short = 'l', long, value_name = "APP", num_args = 0..=1, default_missing_value = "")]
+    logs: Option<Option<String>>,
+    /// With -l: which namespace to view (apps can span several)
+    #[arg(short = 'N', long, value_name = "NAMESPACE")]
+    namespace: Option<String>,
+    /// With -l: a single container to show (default: the pod's default container)
+    #[arg(short = 'C', long, value_name = "CONTAINER")]
+    container: Option<String>,
     /// Re-trigger a dropped build for a repo (owner/name)
     #[arg(long, value_name = "OWNER/NAME")]
     retry: Option<String>,
@@ -150,6 +161,8 @@ fn main() {
             wait: cli.wait,
             follow: cli.follow,
         })
+    } else if let Some(app_opt) = cli.logs {
+        logs(app_opt, cli.repo, cli.namespace, cli.container)
     } else if cli.ship {
         ship(ShipArgs {
             from: cli.from,
@@ -681,6 +694,32 @@ fn trigger_all(
     }
     Ok(())
 }
+/// `sts -l [app]`: tail an ArgoCD app's container logs. The app is optional:
+/// when omitted it is auto-detected from the current repo (via its Jenkins job),
+/// so you can just run `sts -l` inside a repo. `-r` overrides the repo.
+fn logs(
+    app_opt: Option<String>,
+    repo: Option<String>,
+    namespace: Option<String>,
+    container: Option<String>,
+) -> Result<()> {
+    let app = app_opt.filter(|a| !a.trim().is_empty());
+    // With no explicit app, resolve the repo (from -r or the cwd) so
+    // deploy::logs can map its Jenkins job to the ArgoCD app.
+    let repo = if app.is_none() {
+        match repo {
+            Some(r) => Some(r),
+            None => match repo_root() {
+                Ok(dir) => Some(resolve_slug(&dir, None)?),
+                Err(e) => Some(config::default_repo().ok_or(e)?),
+            },
+        }
+    } else {
+        repo
+    };
+    deploy::logs(app, repo, namespace, container)
+}
+
 
 fn list_jobs(repo: Option<String>, all: bool) -> Result<()> {
     let map = JobMap::load()?;

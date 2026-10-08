@@ -13,8 +13,8 @@ use crate::notify;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::io::IsTerminal;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,6 +34,12 @@ const SYNC_POLL_SECS: u64 = 5;
 const PENDING_POLL_SECS: u64 = 5;
 /// How often `sts --follow` advances and redraws the pipeline.
 const FOLLOW_POLL_SECS: u64 = 5;
+/// How often `sts -l` polls ArgoCD for new container log lines.
+const LOGS_POLL_SECS: u64 = 2;
+/// How many trailing lines `sts -l` asks for on its first poll (and each poll;
+/// we dedupe by timestamp so a generous tail just guards against missing lines
+/// between polls).
+const LOGS_TAIL: u32 = 100;
 /// Trim `watch.log` once it grows past this, keeping the most recent lines.
 const LOG_MAX_BYTES: u64 = 1 << 20; // 1 MiB
 const LOG_KEEP_LINES: usize = 2000;
@@ -72,13 +78,7 @@ impl Pending {
 
     /// Last path segment of the job, e.g. `soochi-dash-app`; the usual chart name.
     fn job_name(&self) -> String {
-        let p = self.job.split('?').next().unwrap_or("");
-        let p = p.trim_end_matches('/');
-        let p = p
-            .strip_suffix("/buildWithParameters")
-            .or_else(|| p.strip_suffix("/build"))
-            .unwrap_or(p);
-        p.rsplit('/').next().unwrap_or("").to_string()
+        crate::jobs::Job::parse(&self.job).name()
     }
 
     fn label(&self) -> String {
@@ -384,7 +384,272 @@ pub fn tail_log(n: usize) -> Result<()> {
     Ok(())
 }
 
-/// `sts --sync-status`: show the ArgoCD apps we synced and their live sync/health,
+/// `sts -l [app]`: tail an ArgoCD app's container logs. Polls every
+/// `LOGS_POLL_SECS` and appends only lines newer than the last one seen per pod,
+/// so the terminal scrolls like `kubectl logs -f` instead of being redrawn.
+///
+/// `app` is optional: when omitted it is auto-detected from `repo` (the current
+/// repo's Jenkins job -> Helm chart -> ArgoCD app, the same mapping the deploy
+/// watcher uses). Apps can run across several namespaces, so when the app's pods
+/// span more than one and no `namespace` was given, we ask which to view
+/// (listing them). With a single namespace we use it; `namespace` can also be
+/// passed to skip the prompt.
+pub fn logs(
+    app: Option<String>,
+    repo: Option<String>,
+    namespace: Option<String>,
+    container: Option<String>,
+) -> Result<()> {
+    let Some(cfg) = config::load_argo()? else {
+        bail!(
+            "no ArgoCD token configured (argocd_token in {}); can't read logs",
+            config::config_file().display()
+        );
+    };
+    let argo = Argo::new(cfg);
+
+    // Resolve the ArgoCD app: explicit name, or auto-detected from the repo.
+    let app = match app {
+        Some(a) => a,
+        None => resolve_app_for_repo(&argo, repo.as_deref())?,
+    };
+
+    // Discover the app's pods (and the namespaces they run in) up front.
+    let pods = argo
+        .pods(&app)
+        .with_context(|| format!("listing pods of ArgoCD app `{app}`"))?;
+    if pods.is_empty() {
+        bail!("ArgoCD app `{app}` has no running pods (nothing to log)");
+    }
+
+    let mut namespaces: Vec<String> = pods
+        .iter()
+        .map(|p| p.namespace.clone())
+        .filter(|n| !n.is_empty())
+        .collect();
+    namespaces.sort();
+    namespaces.dedup();
+
+    let ns = choose_namespace(&app, namespace, &namespaces)?;
+
+    let selected: Vec<&argocd::Pod> = pods
+        .iter()
+        .filter(|p| ns.as_deref().map(|n| p.namespace == n).unwrap_or(true))
+        .collect();
+    if selected.is_empty() {
+        bail!(
+            "no pods of `{app}` in namespace `{}` (have: {})",
+            ns.unwrap_or_default(),
+            namespaces.join(", ")
+        );
+    }
+
+    println!(
+        "sts -l {app}  —  {} pod(s){}{}  (polling every {LOGS_POLL_SECS}s, Ctrl-C to stop)",
+        selected.len(),
+        ns.as_deref()
+            .map(|n| format!(" in {n}"))
+            .unwrap_or_default(),
+        container
+            .as_deref()
+            .map(|c| format!(", container {c}"))
+            .unwrap_or_default(),
+    );
+    for p in &selected {
+        let health = if p.health.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", p.health)
+        };
+        println!("  {}{health}", p.name);
+    }
+
+    // Last timestamp printed per pod, so each poll only appends newer lines.
+    let mut last_ts: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let multi = selected.len() > 1;
+    let out = std::io::stdout();
+
+    loop {
+        for pod in &selected {
+            let lines = match argo.logs(
+                &app,
+                &pod.namespace,
+                &pod.name,
+                container.as_deref(),
+                LOGS_TAIL,
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    // Transient error (pod restart, brief 5xx): note it and keep going.
+                    eprintln!("  (logs for {} failed: {e:#})", pod.name);
+                    continue;
+                }
+            };
+
+            let seen = last_ts.get(&pod.name).cloned().unwrap_or_default();
+            let mut newest = seen.clone();
+            let mut handle = out.lock();
+            for line in &lines {
+                // Only append lines strictly after the last timestamp we printed
+                // for this pod. Timestamps are RFC3339, so lexicographic order
+                // matches chronological order. Lines with no timestamp are only
+                // printed on the first poll (when `seen` is empty).
+                let newer = if line.ts.is_empty() {
+                    seen.is_empty()
+                } else {
+                    line.ts.as_str() > seen.as_str()
+                };
+                if !newer {
+                    continue;
+                }
+                if multi {
+                    let _ = writeln!(handle, "[{}] {}", pod.name, line.content);
+                } else {
+                    let _ = writeln!(handle, "{}", line.content);
+                }
+                if line.ts > newest {
+                    newest = line.ts.clone();
+                }
+            }
+            let _ = handle.flush();
+            drop(handle);
+            if !newest.is_empty() {
+                last_ts.insert(pod.name.clone(), newest);
+            } else if seen.is_empty() {
+                // First poll of a pod with no timestamps: mark it seen so we don't
+                // reprint the same untimestamped tail every interval.
+                last_ts.insert(pod.name.clone(), String::new());
+            }
+        }
+        std::thread::sleep(Duration::from_secs(LOGS_POLL_SECS));
+    }
+}
+
+/// Auto-detect the ArgoCD app to tail from a repo: look up the repo's Jenkins
+/// job(s), take each job's chart name (its last path segment) and map it to an
+/// ArgoCD app the same way the deploy watcher does (`app_for_chart`). With one
+/// app we use it; with several we ask on a terminal (or bail with the list when
+/// piped). Errors clearly when the repo has no job or none of its charts match
+/// an app, pointing at `-l <app>` as the fallback.
+fn resolve_app_for_repo(argo: &Argo, repo: Option<&str>) -> Result<String> {
+    let Some(slug) = repo else {
+        bail!("no repo to auto-detect the app from; pass the app name: `sts -l <app>`");
+    };
+    let Some(jobs) = crate::jobs::JobMap::load()?.lookup(slug) else {
+        bail!(
+            "no Jenkins job mapped for `{slug}`, so the ArgoCD app can't be auto-detected; \
+             pass it explicitly: `sts -l <app>` (see `sts -ja` for mapped repos)"
+        );
+    };
+
+    let apps = argo.apps().context("listing ArgoCD apps")?;
+    let mut matched: Vec<String> = Vec::new();
+    let mut charts: Vec<String> = Vec::new();
+    for job in &jobs {
+        let chart = job.name();
+        if chart.is_empty() {
+            continue;
+        }
+        charts.push(chart.clone());
+        if let Some(a) = argocd::app_for_chart(&apps, &chart)
+            && !matched.contains(&a.name)
+        {
+            matched.push(a.name.clone());
+        }
+    }
+
+    match matched.len() {
+        0 => bail!(
+            "none of `{slug}`'s chart(s) ({}) map to an ArgoCD app; \
+             pass the app name: `sts -l <app>`",
+            charts.join(", ")
+        ),
+        1 => {
+            println!("auto-detected app `{}` for {slug}", matched[0]);
+            Ok(matched.remove(0))
+        }
+        _ => {
+            if !std::io::stdin().is_terminal() {
+                bail!(
+                    "`{slug}` maps to several ArgoCD apps ({}); pass one: `sts -l <app>`",
+                    matched.join(", ")
+                );
+            }
+            println!("`{slug}` maps to several ArgoCD apps:");
+            for (i, a) in matched.iter().enumerate() {
+                println!("  {}. {a}", i + 1);
+            }
+            print!("Tail which app? [1-{}] ", matched.len());
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().lock().read_line(&mut answer)?;
+            let answer = answer.trim();
+            if let Ok(i) = answer.parse::<usize>()
+                && (1..=matched.len()).contains(&i)
+            {
+                return Ok(matched.remove(i - 1));
+            }
+            if let Some(a) = matched.iter().find(|a| a.as_str() == answer) {
+                return Ok(a.clone());
+            }
+            bail!("`{answer}` is not one of the listed apps");
+        }
+    }
+}
+
+/// Pick the namespace to view. With one namespace (or none reported) use it.
+/// With several and no explicit choice, ask on a terminal (listing them) or, if
+/// stdin isn't a terminal, bail with the list so the user can pass `-N`.
+/// An explicit `wanted` must match one the app actually runs in.
+fn choose_namespace(
+    app: &str,
+    wanted: Option<String>,
+    namespaces: &[String],
+) -> Result<Option<String>> {
+    if let Some(w) = wanted {
+        if namespaces.is_empty() || namespaces.iter().any(|n| n == &w) {
+            return Ok(Some(w));
+        }
+        bail!(
+            "`{app}` has no pods in namespace `{w}`; it runs in: {}",
+            namespaces.join(", ")
+        );
+    }
+    match namespaces.len() {
+        0 => Ok(None),
+        1 => Ok(Some(namespaces[0].clone())),
+        _ => {
+            if !std::io::stdin().is_terminal() {
+                bail!(
+                    "`{app}` runs in {} namespaces ({}); pass -N <namespace> to pick one",
+                    namespaces.len(),
+                    namespaces.join(", ")
+                );
+            }
+            println!("`{app}` runs in several namespaces:");
+            for (i, n) in namespaces.iter().enumerate() {
+                println!("  {}. {n}", i + 1);
+            }
+            print!("View which namespace? [1-{}] ", namespaces.len());
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().lock().read_line(&mut answer)?;
+            let answer = answer.trim();
+            // Accept either the number or the namespace name typed out.
+            if let Ok(i) = answer.parse::<usize>()
+                && (1..=namespaces.len()).contains(&i)
+            {
+                return Ok(Some(namespaces[i - 1].clone()));
+            }
+            if let Some(n) = namespaces.iter().find(|n| n.as_str() == answer) {
+                return Ok(Some(n.clone()));
+            }
+            bail!("`{answer}` is not one of the listed namespaces");
+        }
+    }
+}
+
+
 /// dropping each once it reaches Synced + Healthy (or vanishes). On a terminal it
 /// refreshes in place every few seconds until the list is empty; piped or
 /// redirected it prints a single snapshot and exits.

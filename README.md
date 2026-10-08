@@ -54,6 +54,35 @@ empty — no need to re-run it. Piped or redirected it prints a single snapshot 
 Only syncs this tool triggered are tracked, and an app that never settles is dropped
 after 30 minutes.
 
+## Tailing container logs
+
+`sts -l <app>` streams an ArgoCD app's container logs straight from the ArgoCD
+API — no `kubectl`, cluster context or pod names needed. It finds the app's pods
+from its resource tree, then polls their logs every 2 seconds and **appends only
+the new lines** to the terminal (it never clears or redraws the screen), so it
+scrolls like `kubectl logs -f`. Ctrl-C to stop.
+
+The app name is optional. Run `sts -l` with no argument inside a repo and it
+auto-detects the app the same way the deploy watcher does: the repo's Jenkins
+job → its Helm chart → the ArgoCD app that deploys that chart. If the repo maps
+to several apps it asks which to tail (or, piped, lists them so you can pass one);
+if it maps to none it tells you to name the app. `-r <owner/name>` picks the repo
+to detect from.
+
+Apps can run across several namespaces. If the app's pods span more than one and
+you didn't pass `-N`, `sts` lists the namespaces and asks which to view; with a
+single namespace it uses it. Pass `-N <namespace>` to pick one up front (required
+when the output is piped, since there's nobody to ask), and `-C <container>` to
+show just one container. It needs `argocd_token` configured with the `logs, get`
+permission.
+
+```sh
+sts -l                                   # auto-detect the app from the current repo
+sts -l soochi-dash-app-test              # name the app; ask for the namespace if there's more than one
+sts -l soochi-dash-app-test -N stage     # view the stage namespace
+sts -l soochi-dash-app-test -N stage -C app   # just the `app` container
+```
+
 If you run `sts -s` while on `stage` itself, it pulls `origin/stage` into your local
 `stage`, pushes it back to `origin/stage` and triggers Jenkins. If the pull
 conflicts, it is aborted and nothing is pushed.
@@ -78,6 +107,7 @@ Short flags combine: `-sy`, `-sd`, `-sny`, `-ja`.
 | `-c, --check` | test the Jenkins and ArgoCD config and credentials |
 | `-P, --pending` | show builds waiting to be synced to ArgoCD |
 | `-S, --sync-status` | show ArgoCD apps still syncing (drops each once Synced + Healthy) |
+| `-l, --logs [app]` | tail an ArgoCD app's logs (auto-detects the app from the repo if omitted; polls every 2s) |
 | `-D, --dashboard` | combined live view of pending builds + syncing apps |
 | `-L, --log` | tail the watch log |
 | `-H, --history` | show recent deploy history (filter with `-r`) |
@@ -97,6 +127,8 @@ Short flags combine: `-sy`, `-sd`, `-sny`, `-ja`.
 | `-p, --push-branch` | with `-s`: also push your branch to origin first |
 | `-f, --from <branch>` | with `-s`: merge a branch other than the current one |
 | `-r, --repo <owner/name>` | override the repo used for the job lookup |
+| `-N, --namespace <ns>` | with `-l`: which namespace to view (apps can span several) |
+| `-C, --container <name>` | with `-l`: show just one container's logs |
 | `-w, --wait <secs>` | how long to wait for build URLs (default 15, 0 = don't) |
 | `-a, --all` | with `-j`: list every mapped repo |
 

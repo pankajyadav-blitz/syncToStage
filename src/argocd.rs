@@ -17,6 +17,21 @@ pub struct App {
     pub paths: Vec<String>,
 }
 
+/// A running pod of an ArgoCD app, from its resource tree.
+pub struct Pod {
+    pub name: String,
+    pub namespace: String,
+    /// `Healthy` / `Progressing` / `Degraded` / ... (empty if unknown).
+    pub health: String,
+}
+
+/// One line of container output from the logs API. `ts` is the raw RFC3339
+/// timestamp ArgoCD attaches, used to drop lines we have already printed.
+pub struct LogLine {
+    pub ts: String,
+    pub content: String,
+}
+
 pub enum SyncOutcome {
     Started,
     /// "another operation is already in progress": a sync is running already
@@ -160,6 +175,71 @@ impl Argo {
         }))
     }
 
+    /// The pods of an app, read from its resource tree. Each carries the
+    /// namespace it runs in (apps can span namespaces) and its health.
+    pub fn pods(&self, app: &str) -> Result<Vec<Pod>> {
+        let v = self.get_json(&format!("/api/v1/applications/{app}/resource-tree"))?;
+        let nodes = v["nodes"].as_array().cloned().unwrap_or_default();
+        Ok(nodes
+            .iter()
+            .filter(|n| n["kind"].as_str() == Some("Pod"))
+            .map(|n| Pod {
+                name: n["name"].as_str().unwrap_or_default().to_string(),
+                namespace: n["namespace"].as_str().unwrap_or_default().to_string(),
+                health: n["health"]["status"].as_str().unwrap_or("").to_string(),
+            })
+            .filter(|p| !p.name.is_empty())
+            .collect())
+    }
+
+    /// The last `tail` lines of a pod's logs (optionally one container), each
+    /// with the RFC3339 timestamp ArgoCD attaches. ArgoCD answers with
+    /// newline-delimited JSON: one `{"result":{"content","timeStamp",...}}` per
+    /// line. We poll this on an interval rather than holding a `follow=true`
+    /// stream open, so the caller dedupes by timestamp between polls.
+    pub fn logs(
+        &self,
+        app: &str,
+        namespace: &str,
+        pod: &str,
+        container: Option<&str>,
+        tail: u32,
+    ) -> Result<Vec<LogLine>> {
+        let mut path = format!(
+            "/api/v1/applications/{app}/logs?namespace={}&podName={}&tailLines={tail}",
+            enc(namespace),
+            enc(pod),
+        );
+        if let Some(c) = container {
+            path.push_str(&format!("&container={}", enc(c)));
+        }
+        let url = format!("{}{path}", self.cfg.url);
+        let mut resp = self
+            .agent
+            .get(&url)
+            .header("Authorization", &self.auth)
+            .call()
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status().as_u16();
+        let body = resp
+            .body_mut()
+            .with_config()
+            .limit(64 * 1024 * 1024)
+            .read_to_string()
+            .unwrap_or_default();
+        match status {
+            200 => Ok(parse_log_stream(&body)),
+            401 | 403 => bail!(
+                "ArgoCD rejected the token (HTTP {status}) for logs of {app} (needs the `logs, get` permission)"
+            ),
+            404 => bail!("ArgoCD app {app} or pod {pod} not found (HTTP 404)"),
+            _ => bail!(
+                "ArgoCD returned HTTP {status} for logs of {app}: {}",
+                snippet(&body)
+            ),
+        }
+    }
+
     fn get_json(&self, path: &str) -> Result<serde_json::Value> {
         let url = format!("{}{path}", self.cfg.url);
         let mut resp = self
@@ -222,6 +302,52 @@ pub fn app_for_chart<'a>(apps: &'a [App], chart: &str) -> Option<&'a App> {
 fn snippet(body: &str) -> String {
     let text = body.split_whitespace().collect::<Vec<_>>().join(" ");
     text.chars().take(300).collect()
+}
+
+/// Parse ArgoCD's newline-delimited log stream. Each non-empty line is a JSON
+/// object `{"result":{"content":"...","timeStamp":"...","podName":"..."}}`.
+/// Lines that don't parse (or carry no content) are skipped. The `last` marker
+/// ArgoCD sends to close a stream carries no content and is ignored.
+fn parse_log_stream(body: &str) -> Vec<LogLine> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let r = &v["result"];
+        let Some(content) = r["content"].as_str() else {
+            continue;
+        };
+        out.push(LogLine {
+            // ArgoCD spells it `timeStamp`; fall back to `timeStampStr`.
+            ts: r["timeStamp"]
+                .as_str()
+                .or_else(|| r["timeStampStr"].as_str())
+                .unwrap_or("")
+                .to_string(),
+            content: content.trim_end_matches('\n').to_string(),
+        });
+    }
+    out
+}
+
+/// Minimal percent-encoding for a query-string value. Pod and namespace names
+/// are DNS labels (safe already), but container names and anything the user
+/// types could contain reserved characters, so encode defensively.
+fn enc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -291,5 +417,26 @@ cicd/helm/stage-argocd-helm/other/Chart.yaml\n";
             phase: String::new(),
         };
         assert!(!progressing.is_settled());
+    }
+
+    #[test]
+    fn parses_argocd_log_stream() {
+        let body = "\
+{\"result\":{\"content\":\"line one\",\"timeStamp\":\"2026-10-08T08:00:00Z\",\"podName\":\"web-1\"}}\n\
+\n\
+{\"result\":{\"content\":\"line two\\n\",\"timeStamp\":\"2026-10-08T08:00:01Z\",\"podName\":\"web-1\"}}\n\
+not json\n\
+{\"result\":{\"last\":true}}\n";
+        let lines = parse_log_stream(body);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].content, "line one");
+        assert_eq!(lines[0].ts, "2026-10-08T08:00:00Z");
+        assert_eq!(lines[1].content, "line two"); // trailing newline trimmed
+    }
+
+    #[test]
+    fn enc_leaves_safe_chars_and_escapes_others() {
+        assert_eq!(enc("web-app_1.0~x"), "web-app_1.0~x");
+        assert_eq!(enc("a b/c"), "a%20b%2Fc");
     }
 }

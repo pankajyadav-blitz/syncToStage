@@ -65,6 +65,17 @@ impl Job {
             .unwrap_or(p);
         format!("{p}/")
     }
+
+    /// The job's last path segment, e.g. `dashboard` — usually the Helm chart
+    /// name, which maps to an ArgoCD app via `argocd::app_for_chart`.
+    pub fn name(&self) -> String {
+        self.job_path()
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
 }
 
 pub struct JobMap {
