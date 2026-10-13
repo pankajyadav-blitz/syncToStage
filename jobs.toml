@@ -122,7 +122,7 @@
 "Blitzscale-19/titanic" = ["/job/stage/job/orders/job/titanic/job/titanic-app/build"]
 "Blitzscale-19/vartalap" = [
     "/job/stage/job/soochi/job/vartalap-app/build",
-    "/job/stage/job/soochi/job/vartalap-app/build",
+    "/job/stage/job/soochi/job/vartalap-dash/build",
 ]
 "Blitzscale-19/vikreta-chalan" = [
     "/job/stage/job/finance/job/vikreta-chalan/job/vikreta-chalan-app/build",
