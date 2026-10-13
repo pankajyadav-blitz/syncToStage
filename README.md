@@ -13,7 +13,10 @@ sts -sy                 # same, no confirmation
 
 1. Checks your Jenkins credentials (skipped with `-n` or when the repo has no job mapped).
 2. Fetches `origin/stage`. Local `stage` is ignored: whatever is on GitHub wins.
-3. Prints the commits that will land on stage and asks for confirmation.
+3. Prints the commits that will land on stage. If the repo maps to more than one
+   Jenkins job (e.g. `-app`, `-dash`, `-web`), asks which to trigger: numbers or
+   job names, comma-separated, or `a` for all. `-a` triggers all without asking.
+   Then asks for confirmation.
 4. Merges your branch (`--no-ff`) onto `origin/stage` in a temporary worktree,
    so your checkout and any uncommitted changes are left alone.
 5. Pushes `stage`. It never force-pushes. If someone else pushed in the meantime,
@@ -96,7 +99,7 @@ the conflict, do it on a throwaway branch cut from `origin/stage`, not on your b
 
 ## Flags
 
-Short flags combine: `-sy`, `-sd`, `-sny`, `-ja`.
+Short flags combine: `-sy`, `-sd`, `-sny`, `-sa`, `-ja`.
 
 | mode (pick one, or none for the dashboard) | |
 |---|---|
@@ -130,11 +133,13 @@ Short flags combine: `-sy`, `-sd`, `-sny`, `-ja`.
 | `-N, --namespace <ns>` | with `-l`: which namespace to view (apps can span several) |
 | `-C, --container <name>` | with `-l`: show just one container's logs |
 | `-w, --wait <secs>` | how long to wait for build URLs (default 15, 0 = don't) |
-| `-a, --all` | with `-j`: list every mapped repo |
+| `-a, --all` | with `-j`: list every mapped repo; with `-s`/`-b`/`--retry`: trigger all of a multi-job repo's jobs without asking |
 
 Common combinations:
 
 - `sts -sy` — ship, no confirmation
+- `sts -sya` — ship and trigger every job, no prompts at all
+- `sts -ba` — rebuild every job of this repo without asking
 - `sts -sd` — dry run of a ship (shows commits + diff summary)
 - `sts -sn` — ship without triggering Jenkins
 - `sts -sF` — ship, then follow the build + sync to completion

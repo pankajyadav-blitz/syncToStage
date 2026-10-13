@@ -28,10 +28,11 @@ const STAGE: &str = "stage";
         sts          live dashboard: builds + ArgoCD syncs in progress\n  \
         sts -s      ship: merge current branch into stage, push, build (asks first)\n  \
         sts -sy     same, no confirmation\n  \
+        sts -sa     ship and trigger every job of a multi-job repo without asking\n  \
         sts -sd     dry run: show what -s would do (with a diff summary)\n  \
         sts -sn     ship without triggering Jenkins\n  \
         sts -sF     ship, then follow the build + sync to completion\n  \
-        sts -b      trigger this repo's Jenkins build only\n  \
+        sts -b      trigger this repo's Jenkins build only (asks which job if several; -ba for all)\n  \
         sts -j      show this repo's Jenkins jobs (-ja for all)\n  \
         sts -c      check Jenkins/ArgoCD config and credentials\n  \
         sts -P      show builds waiting to be synced to ArgoCD\n  \
@@ -123,8 +124,9 @@ struct Cli {
     /// Seconds to wait for Jenkins to start each build and print its URL (0 = don't wait)
     #[arg(short = 'w', long, value_name = "SECS", default_value_t = 15)]
     wait: u64,
-    /// With -j: list every mapped repo
-    #[arg(short = 'a', long, conflicts_with_all = ["ship", "build", "check", "pending", "watch", "sync_status"])]
+    /// With -j: list every mapped repo. With -s/-b/--retry: trigger all of the
+    /// repo's Jenkins jobs instead of asking which
+    #[arg(short = 'a', long, conflicts_with_all = ["check", "pending", "watch", "sync_status"])]
     all: bool,
 }
 
@@ -138,6 +140,7 @@ struct ShipArgs {
     yes: bool,
     wait: u64,
     follow: bool,
+    all: bool,
 }
 
 struct BuildArgs {
@@ -146,6 +149,7 @@ struct BuildArgs {
     dry_run: bool,
     wait: u64,
     follow: bool,
+    all: bool,
 }
 
 fn main() {
@@ -160,6 +164,7 @@ fn main() {
             dry_run: cli.dry_run,
             wait: cli.wait,
             follow: cli.follow,
+            all: cli.all,
         })
     } else if let Some(app_opt) = cli.logs {
         logs(app_opt, cli.repo, cli.namespace, cli.container)
@@ -174,6 +179,7 @@ fn main() {
             yes: cli.yes,
             wait: cli.wait,
             follow: cli.follow,
+            all: cli.all,
         })
     } else if cli.build {
         build(BuildArgs {
@@ -182,6 +188,7 @@ fn main() {
             dry_run: cli.dry_run,
             wait: cli.wait,
             follow: cli.follow,
+            all: cli.all,
         })
     } else if cli.jobs {
         list_jobs(cli.repo, cli.all)
@@ -257,10 +264,11 @@ fn ship(a: ShipArgs) -> Result<()> {
         }
         if a.dry_run {
             println!("Dry run: stage is up to date; would trigger the Jenkins build.");
-            print_jenkins_plan(&slug, &jobs, a.no_build);
+            print_jenkins_plan(&slug, &jobs, a.no_build, a.all);
             print_argo_plan(&jobs, a.no_build, a.no_argo, argo);
             return Ok(());
         }
+        let jobs = choose_jobs(jobs, a.no_build, a.all)?;
         println!("Triggering the Jenkins build to rebuild stage anyway.");
         return finish_build(&slug, jobs, jenkins, a.no_build, argo, a.wait, a.follow);
     }
@@ -280,7 +288,7 @@ fn ship(a: ShipArgs) -> Result<()> {
     if !dirty.is_empty() {
         println!("  note      uncommitted changes in your working tree are NOT included");
     }
-    print_jenkins_plan(&slug, &jobs, a.no_build);
+    print_jenkins_plan(&slug, &jobs, a.no_build, a.all);
     print_argo_plan(&jobs, a.no_build, a.no_argo, argo);
     println!();
 
@@ -288,6 +296,7 @@ fn ship(a: ShipArgs) -> Result<()> {
         println!("Dry run: nothing merged, pushed or built.");
         return Ok(());
     }
+    let jobs = choose_jobs(jobs, a.no_build, a.all)?;
     if !a.yes && !confirm(&format!("Merge `{source}` into {STAGE} and push?"))? {
         bail!("aborted");
     }
@@ -346,7 +355,7 @@ fn ship_stage(a: ShipArgs, repo_dir: &Path) -> Result<()> {
             println!("              {l}");
         }
     }
-    print_jenkins_plan(&slug, &jobs, a.no_build);
+    print_jenkins_plan(&slug, &jobs, a.no_build, a.all);
     print_argo_plan(&jobs, a.no_build, a.no_argo, argo);
     println!();
 
@@ -354,6 +363,7 @@ fn ship_stage(a: ShipArgs, repo_dir: &Path) -> Result<()> {
         println!("Dry run: nothing pulled, pushed or built.");
         return Ok(());
     }
+    let jobs = choose_jobs(jobs, a.no_build, a.all)?;
     if !a.yes
         && !confirm(&format!(
             "Pull {remote_stage} into {STAGE}, push and build?"
@@ -461,10 +471,16 @@ fn print_argo_plan(jobs: &Option<Vec<Job>>, no_build: bool, no_argo: bool, argo:
     }
 }
 
-fn print_jenkins_plan(slug: &str, jobs: &Option<Vec<Job>>, no_build: bool) {
+fn print_jenkins_plan(slug: &str, jobs: &Option<Vec<Job>>, no_build: bool, all: bool) {
     match (jobs, no_build) {
         (_, true) => println!("  jenkins   skipped (-n)"),
         (None, _) => println!("  jenkins   no job mapped for {slug} (see `sts -ja`)"),
+        (Some(jobs), _) if jobs.len() > 1 && !all => {
+            println!("  jenkins   {} job(s), will ask which to trigger (-a for all):", jobs.len());
+            for j in jobs {
+                println!("              {}", j.raw);
+            }
+        }
         (Some(jobs), _) => {
             println!("  jenkins   {} job(s):", jobs.len());
             for j in jobs {
@@ -472,6 +488,65 @@ fn print_jenkins_plan(slug: &str, jobs: &Option<Vec<Job>>, no_build: bool) {
             }
         }
     }
+}
+
+/// When a repo maps to several Jenkins jobs, ask which to trigger (numbers or
+/// job names, comma-separated, or `a` for all); `-a` skips the question. Asked
+/// before anything is pushed, so a bad answer leaves stage untouched.
+fn choose_jobs(jobs: Option<Vec<Job>>, no_build: bool, all: bool) -> Result<Option<Vec<Job>>> {
+    let Some(jobs) = jobs else {
+        return Ok(None);
+    };
+    if no_build || all || jobs.len() <= 1 {
+        return Ok(Some(jobs));
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "this repo has {} Jenkins jobs; pass -a to trigger all of them",
+            jobs.len()
+        );
+    }
+    println!("This repo has {} Jenkins jobs:", jobs.len());
+    for (i, j) in jobs.iter().enumerate() {
+        println!("  {}. {:<24} {}", i + 1, j.name(), j.raw);
+    }
+    print!(
+        "Trigger which? [1-{}, comma-separated, a = all] ",
+        jobs.len()
+    );
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    let picked = parse_job_choice(answer.trim(), &jobs)?;
+    Ok(Some(
+        jobs.into_iter()
+            .zip(picked)
+            .filter_map(|(j, p)| p.then_some(j))
+            .collect(),
+    ))
+}
+
+/// Which of `jobs` an answer to the "Trigger which?" prompt selects: `a`/`all`,
+/// or 1-based numbers and job names separated by commas or spaces.
+fn parse_job_choice(answer: &str, jobs: &[Job]) -> Result<Vec<bool>> {
+    if answer.is_empty() {
+        bail!("aborted: no job chosen");
+    }
+    if matches!(answer.to_lowercase().as_str(), "a" | "all") {
+        return Ok(vec![true; jobs.len()]);
+    }
+    let mut picked = vec![false; jobs.len()];
+    for tok in answer.split([',', ' ']).filter(|t| !t.is_empty()) {
+        let i = match tok.parse::<usize>() {
+            Ok(i) if (1..=jobs.len()).contains(&i) => i - 1,
+            _ => jobs
+                .iter()
+                .position(|j| j.name() == tok)
+                .with_context(|| format!("`{tok}` is not one of the listed jobs"))?,
+        };
+        picked[i] = true;
+    }
+    Ok(picked)
 }
 
 fn finish_build(
@@ -596,7 +671,11 @@ fn build(a: BuildArgs) -> Result<()> {
         return Ok(());
     };
     if a.dry_run {
-        println!("Would trigger {} job(s) for {slug}:", jobs.len());
+        if jobs.len() > 1 && !a.all {
+            println!("Would ask which of {} job(s) to trigger for {slug} (-a for all):", jobs.len());
+        } else {
+            println!("Would trigger {} job(s) for {slug}:", jobs.len());
+        }
         for j in &jobs {
             println!("  {}", j.raw);
         }
@@ -608,6 +687,7 @@ fn build(a: BuildArgs) -> Result<()> {
         );
         return Ok(());
     }
+    let jobs = choose_jobs(Some(jobs), false, a.all)?.unwrap_or_default();
     let jenkins = connect()?;
     let argo = !a.no_argo && argo_configured()?;
     trigger_all(&jenkins, &slug, &jobs, argo, a.wait, a.follow)
@@ -897,4 +977,28 @@ fn indent(text: &str) -> String {
         .map(|l| format!("  {l}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jobs() -> Vec<Job> {
+        ["app", "dash", "web"]
+            .iter()
+            .map(|n| Job::parse(&format!("/job/stage/job/x/job/x-{n}/build")))
+            .collect()
+    }
+
+    #[test]
+    fn job_choice_by_number_name_or_all() {
+        let j = jobs();
+        assert_eq!(parse_job_choice("2", &j).unwrap(), [false, true, false]);
+        assert_eq!(parse_job_choice("3, 1", &j).unwrap(), [true, false, true]);
+        assert_eq!(parse_job_choice("x-dash x-web", &j).unwrap(), [false, true, true]);
+        assert_eq!(parse_job_choice("A", &j).unwrap(), [true, true, true]);
+        assert!(parse_job_choice("", &j).is_err());
+        assert!(parse_job_choice("4", &j).is_err());
+        assert!(parse_job_choice("nope", &j).is_err());
+    }
 }
