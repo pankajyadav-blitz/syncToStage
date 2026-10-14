@@ -67,28 +67,29 @@ pub fn record(repo: &str, result: &str, detail: &str) -> Result<()> {
 
 /// `sts --history [repo]`: print the most recent deploys, newest first,
 /// optionally filtered to one repo (substring match on the slug).
-pub fn show(filter: Option<&str>) -> Result<()> {
+pub fn show(ui: &mut dyn crate::ui::Ui, filter: Option<&str>) -> Result<()> {
     let mut items = read();
     if items.is_empty() {
-        println!("No deploy history yet ({}).", history_file().display());
+        ui.info(&format!("No deploy history yet ({}).", history_file().display()));
         return Ok(());
     }
     if let Some(f) = filter {
         items.retain(|r| r.repo.contains(f));
         if items.is_empty() {
-            println!("No deploy history for `{f}`.");
+            ui.info(&format!("No deploy history for `{f}`."));
             return Ok(());
         }
     }
-    println!("history: {}", history_file().display());
+    ui.detail(&format!("history: {}", history_file().display()));
     for r in items.iter().rev() {
-        println!(
-            "  {:<9} {:<28} {}  ({})",
-            r.result,
-            r.repo,
-            ago(r.at),
-            r.detail
-        );
+        let line = format!("{:<9} {:<28} {}  ({})", r.result, r.repo, ago(r.at), r.detail);
+        // Colour the outcome: successes green, failures red, the rest neutral.
+        match r.result.as_str() {
+            "SUCCESS" | "SYNCED" => ui.ok(&line),
+            "FAILURE" | "ABORTED" | "CANCELLED" | "GAVE_UP" | "SYNC_FAILED" | "DEGRADED"
+            | "LOST" => ui.err(&line),
+            _ => ui.info(&line),
+        }
     }
     Ok(())
 }

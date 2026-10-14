@@ -10,6 +10,7 @@ use crate::config;
 use crate::history;
 use crate::jenkins::{Jenkins, QueueState};
 use crate::notify;
+use crate::style;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -28,11 +29,9 @@ const MAX_SYNC_ATTEMPTS: u32 = 3;
 /// How often the watcher polls. cron's floor is 1 minute, so a single `--watch`
 /// run loops internally, firing a tick every `WATCH_INTERVAL_SECS` for one minute.
 const WATCH_INTERVAL_SECS: u64 = 10;
-/// How often `sts -S` refreshes the live sync view on a terminal.
-const SYNC_POLL_SECS: u64 = 5;
-/// How often `sts -P` refreshes the live pending view on a terminal.
-const PENDING_POLL_SECS: u64 = 5;
-/// How often `sts --follow` advances and redraws the pipeline.
+/// How often `sts --follow` advances and redraws the pipeline (piped path; the
+/// TUI uses its own cadence). The live `-P`/`-S`/dashboard views also refresh
+/// on the TUI's internal timer.
 const FOLLOW_POLL_SECS: u64 = 5;
 /// How often `sts -l` polls ArgoCD for new container log lines.
 const LOGS_POLL_SECS: u64 = 2;
@@ -250,37 +249,178 @@ pub fn enqueue(entries: Vec<Pending>) -> Result<()> {
     install_cron()
 }
 
+/// A build row for the dashboard: one entry in the pending queue, resolved to
+/// a display state. Produced by `collect_builds` and rendered either as a plain
+/// snapshot (piped) or in the ratatui TUI (on a terminal).
+pub struct BuildRow {
+    /// "building" or "queued".
+    pub state: BuildState,
+    /// Build/job URL (the clickable thing).
+    pub label: String,
+    pub repo: String,
+    pub age_secs: u64,
+    /// Seconds the build has been running (from Jenkins), if building; the TUI
+    /// adds the since-poll offset so it ticks every second between polls.
+    pub elapsed: Option<u64>,
+    /// Jenkins' estimate of total build time in seconds, if known.
+    pub estimated: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum BuildState {
+    Queued,
+    Building,
+}
+
+/// What the whole builds panel shows at a glance.
+pub struct BuildsView {
+    pub cron_installed: bool,
+    pub rows: Vec<BuildRow>,
+}
+
+impl BuildsView {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+/// A sync row for the dashboard: one ArgoCD app we are tracking, resolved to a
+/// display status. Settled/failed apps appear once (as `done`) then drop out.
+pub struct SyncRow {
+    pub status: SyncState,
+    pub app: String,
+    /// e.g. "Synced/Healthy" or "OutOfSync/Progressing, Running".
+    pub detail: String,
+    pub repo: String,
+    pub age_secs: u64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SyncState {
+    /// Still reconciling.
+    Syncing,
+    /// Reached Synced + Healthy.
+    Synced,
+    /// Degraded after sync.
+    Degraded,
+    /// No such ArgoCD app anymore.
+    Gone,
+    /// Gave up after the timeout.
+    GaveUp,
+    /// Transient status-check error; kept and retried.
+    Unknown,
+}
+
+/// What the whole ArgoCD panel shows at a glance.
+pub struct SyncView {
+    /// None when no ArgoCD token is configured (can't check).
+    pub rows: Option<Vec<SyncRow>>,
+}
+
+impl SyncView {
+    pub fn is_empty(&self) -> bool {
+        self.rows.as_ref().is_none_or(|r| r.is_empty())
+    }
+}
+
+/// Gather the pending-build queue into display rows without printing. Shares
+/// the exact queue/Jenkins-polling logic the snapshot path uses; the only
+/// difference is it returns data instead of writing lines. Does not mutate the
+/// queue (the cron watcher owns that).
+fn collect_builds() -> Result<BuildsView> {
+    let q = Queue::open()?;
+    let cron = cron_installed().unwrap_or(false);
+    let t = now();
+    let jenkins = if q.items.iter().any(|p| p.build_url.is_some()) {
+        config::load().ok().map(Jenkins::new)
+    } else {
+        None
+    };
+    let rows = q
+        .items
+        .iter()
+        .map(|p| {
+            let progress = match (&p.build_url, &jenkins) {
+                (Some(url), Some(j)) => j.build_progress(url),
+                _ => None,
+            };
+            BuildRow {
+                state: if p.build_url.is_some() {
+                    BuildState::Building
+                } else {
+                    BuildState::Queued
+                },
+                label: p.label(),
+                repo: p.repo.clone(),
+                age_secs: t.saturating_sub(p.queued_at),
+                elapsed: progress.as_ref().map(|pr| pr.elapsed),
+                estimated: progress.as_ref().and_then(|pr| pr.estimated),
+            }
+        })
+        .collect();
+    Ok(BuildsView {
+        cron_installed: cron,
+        rows,
+    })
+}
+
 /// `sts --pending`: show the builds waiting to be synced to ArgoCD. On a
 /// terminal it refreshes in place every few seconds (dropping each build as the
 /// cron watcher deploys it) and exits once the queue is empty; piped or
 /// redirected it prints a single snapshot and exits.
 pub fn show() -> Result<()> {
-    let live = std::io::stdout().is_terminal();
-    loop {
-        if live {
-            clear_screen();
-            println!("sts -P  —  {}  (Ctrl-C to stop)", utc_now());
-        }
-        let empty = show_once()?;
-        if empty || !live {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_secs(PENDING_POLL_SECS));
+    if std::io::stdout().is_terminal() {
+        return run_tui(crate::tui::View::Pending);
     }
+    // Piped: a single plain snapshot.
+    println!("{} {}", style::dim("sts -P"), style::dim(&utc_now()));
+    show_once()?;
+    Ok(())
+}
+
+/// Build the TUI `Snapshot` for `view`, collecting only the panels it shows.
+fn tui_snapshot(view: crate::tui::View) -> Result<crate::tui::Snapshot> {
+    let builds = if view.shows_builds() {
+        Some(collect_builds()?)
+    } else {
+        None
+    };
+    let syncs = if view.shows_syncs() {
+        Some(collect_syncing()?)
+    } else {
+        None
+    };
+    Ok(crate::tui::Snapshot {
+        builds,
+        syncs,
+    })
+}
+
+/// Launch the ratatui dashboard for a non-`Follow` view. The refresh callback
+/// is a no-op (the cron watcher advances the pipeline); `--follow` uses
+/// `run_follow_tui` instead, which advances it inline.
+fn run_tui(view: crate::tui::View) -> Result<()> {
+    crate::tui::run(view, || Ok(()), move || tui_snapshot(view))?;
+    Ok(())
 }
 
 /// One pass of the pending view. Returns true when the queue is empty.
 fn show_once() -> Result<bool> {
     let q = Queue::open()?;
     let cron = cron_installed().unwrap_or(false);
-    println!("queue:   {}", queue_file().display());
-    println!("log:     {}", log_file().display());
+    println!("{} {}", style::dim("queue:"), queue_file().display());
+    println!("{} {}", style::dim("log:  "), log_file().display());
     println!(
-        "cron:    {}",
-        if cron { "installed" } else { "not installed" }
+        "{} {}",
+        style::dim("cron: "),
+        if cron {
+            style::green("installed")
+        } else {
+            style::yellow("not installed")
+        }
     );
     if q.items.is_empty() {
-        println!("No builds waiting to be deployed.");
+        println!("{} No builds waiting to be deployed.", style::ok());
         return Ok(true);
     }
     let t = now();
@@ -292,10 +432,11 @@ fn show_once() -> Result<bool> {
         None
     };
     for p in &q.items {
-        let state = if p.build_url.is_some() {
-            "building"
+        let building = p.build_url.is_some();
+        let state = if building {
+            style::bold_cyan("building")
         } else {
-            "queued"
+            style::yellow("queued  ")
         };
         let progress = match (&p.build_url, &jenkins) {
             (Some(url), Some(j)) => j
@@ -305,10 +446,14 @@ fn show_once() -> Result<bool> {
             _ => String::new(),
         };
         println!(
-            "  {state:<9} {}  ({}s ago, {}{progress})",
+            "  {} {state}  {}  {}",
+            style::busy(),
             p.label(),
-            t.saturating_sub(p.queued_at),
-            p.repo
+            style::dim(&format!(
+                "({}s ago, {}{progress})",
+                t.saturating_sub(p.queued_at),
+                p.repo
+            )),
         );
     }
     Ok(false)
@@ -319,21 +464,16 @@ fn show_once() -> Result<bool> {
 /// syncing (from `-S`) — in one auto-refreshing screen. On a terminal it
 /// refreshes until both are empty; piped it prints a single snapshot.
 pub fn dashboard() -> Result<()> {
-    let live = std::io::stdout().is_terminal();
-    loop {
-        if live {
-            clear_screen();
-            println!("sts dashboard  —  {}  (Ctrl-C to stop)", utc_now());
-        }
-        println!("── builds ──────────────────────────────────");
-        let builds_empty = show_once()?;
-        println!("── argocd ──────────────────────────────────");
-        let syncs_empty = sync_status_once()?;
-        if (builds_empty && syncs_empty) || !live {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_secs(PENDING_POLL_SECS));
+    if std::io::stdout().is_terminal() {
+        return run_tui(crate::tui::View::Dashboard);
     }
+    // Piped: a single plain snapshot of both sections.
+    println!("{} {}", style::dim("sts dashboard"), style::dim(&utc_now()));
+    println!("── builds ──────────────────────────────────");
+    show_once()?;
+    println!("── argocd ──────────────────────────────────");
+    sync_status_once()?;
+    Ok(())
 }
 
 /// Block until the given repo's builds (and the syncs they trigger) finish,
@@ -342,23 +482,49 @@ pub fn dashboard() -> Result<()> {
 /// inline so it works even if cron hasn't fired yet. Returns when both queues
 /// are empty.
 pub fn follow() -> Result<()> {
-    let live = std::io::stdout().is_terminal();
-    loop {
-        // Advance the pipeline ourselves rather than waiting on cron.
+    // The pipeline is advanced inline (rather than waiting on cron) by running
+    // a watcher tick + sync check each cycle. Shared by both the TUI and the
+    // piped path.
+    let advance = || -> Result<()> {
         tick()?;
         if let Err(e) = check_syncing(SyncMode::Notify) {
             log(&format!("sync check failed: {e:#}"));
         }
-        if live {
-            clear_screen();
-            println!("sts --follow  —  {}  (Ctrl-C to stop)", utc_now());
+        Ok(())
+    };
+
+    if std::io::stdout().is_terminal() {
+        let drained = crate::tui::run(
+            crate::tui::View::Follow,
+            advance,
+            || tui_snapshot(crate::tui::View::Follow),
+        )?;
+        // Only announce completion if the pipeline actually drained (not if the
+        // user quit early). Printed after the terminal is restored.
+        if drained {
+            println!(
+                "{} {}",
+                style::ok(),
+                style::bold_green("All builds deployed and synced.")
+            );
         }
+        return Ok(());
+    }
+
+    // Piped: advance and print a plain snapshot each cycle until drained.
+    loop {
+        advance()?;
+        println!("{} {}", style::dim("sts --follow"), style::dim(&utc_now()));
         println!("── builds ──────────────────────────────────");
         let builds_empty = show_once()?;
         println!("── argocd ──────────────────────────────────");
         let syncs_empty = sync_status_once()?;
         if builds_empty && syncs_empty {
-            println!("\nAll builds deployed and synced.");
+            println!(
+                "\n{} {}",
+                style::ok(),
+                style::bold_green("All builds deployed and synced.")
+            );
             return Ok(());
         }
         std::thread::sleep(Duration::from_secs(FOLLOW_POLL_SECS));
@@ -445,15 +611,20 @@ pub fn logs(
     }
 
     println!(
-        "sts -l {app}  —  {} pod(s){}{}  (polling every {LOGS_POLL_SECS}s, Ctrl-C to stop)",
-        selected.len(),
-        ns.as_deref()
-            .map(|n| format!(" in {n}"))
-            .unwrap_or_default(),
-        container
-            .as_deref()
-            .map(|c| format!(", container {c}"))
-            .unwrap_or_default(),
+        "{}  {}  {}",
+        style::bold_cyan(&format!("sts -l {app}")),
+        style::dim(&format!(
+            "{} pod(s){}{}",
+            selected.len(),
+            ns.as_deref()
+                .map(|n| format!(" in {n}"))
+                .unwrap_or_default(),
+            container
+                .as_deref()
+                .map(|c| format!(", container {c}"))
+                .unwrap_or_default(),
+        )),
+        style::dim(&format!("(polling every {LOGS_POLL_SECS}s, Ctrl-C to stop)")),
     );
     for p in &selected {
         let health = if p.health.is_empty() {
@@ -654,18 +825,13 @@ fn choose_namespace(
 /// refreshes in place every few seconds until the list is empty; piped or
 /// redirected it prints a single snapshot and exits.
 pub fn sync_status() -> Result<()> {
-    let live = std::io::stdout().is_terminal();
-    loop {
-        if live {
-            clear_screen();
-            println!("sts -S  —  {}  (Ctrl-C to stop)", utc_now());
-        }
-        let empty = sync_status_once()?;
-        if empty || !live {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_secs(SYNC_POLL_SECS));
+    if std::io::stdout().is_terminal() {
+        return run_tui(crate::tui::View::Sync);
     }
+    // Piped: a single plain snapshot.
+    println!("{} {}", style::dim("sts -S"), style::dim(&utc_now()));
+    sync_status_once()?;
+    Ok(())
 }
 
 /// One pass: poll ArgoCD for each tracked app, print the status, prune settled
@@ -673,36 +839,55 @@ pub fn sync_status() -> Result<()> {
 /// released as soon as this returns, so the cron watcher can enqueue new syncs
 /// between polls.
 fn sync_status_once() -> Result<bool> {
-    check_syncing(SyncMode::Print)
+    let (empty, rows) = check_syncing(SyncMode::Print)?;
+    drop(rows);
+    Ok(empty)
 }
 
-/// Whether a syncing-list pass should print to stdout (interactive `sts -S`) or
-/// fire desktop/webhook notifications (the background cron watcher).
+/// Collect the syncing list into display rows (for the TUI) while running the
+/// exact same prune/save pass `sts -S` does. Returns the apps settled/failed
+/// this pass plus the ones still in progress, newest state first.
+fn collect_syncing() -> Result<SyncView> {
+    let (_empty, rows) = check_syncing(SyncMode::Collect)?;
+    Ok(SyncView { rows })
+}
+
+/// What a syncing-list pass should do with each app's status: print it
+/// (`sts -S`), collect it into rows (the TUI), or stay silent but fire
+/// notifications + record history (the cron watcher).
 #[derive(Clone, Copy, PartialEq)]
 enum SyncMode {
     /// `sts -S`: print each app's live status; no notifications.
     Print,
+    /// The TUI dashboard: return rows to render; no notifications.
+    Collect,
     /// cron `--watch`: silent, but notify + record history as apps settle or fail.
     Notify,
 }
 
-/// Shared core for both the interactive `sts -S` view and the cron watcher's
-/// sync-completion check. Polls each tracked app, prunes the ones that have
-/// settled (or vanished, or timed out), and in `Notify` mode fires a
-/// notification and records history for each terminal outcome. Returns true
-/// when nothing is left to track.
-fn check_syncing(mode: SyncMode) -> Result<bool> {
+/// Shared core for the interactive `sts -S` view, the TUI dashboard and the
+/// cron watcher's sync-completion check. Polls each tracked app, prunes the
+/// ones that have settled (or vanished, or timed out), and in `Notify` mode
+/// fires a notification and records history for each terminal outcome. Returns
+/// `(empty, rows)`: `empty` is true when nothing is left to track; `rows` is
+/// `Some` only in `Collect` mode (settled/failed-this-pass rows first, then
+/// the ones still syncing).
+fn check_syncing(mode: SyncMode) -> Result<(bool, Option<Vec<SyncRow>>)> {
     let print = mode == SyncMode::Print;
     let notify = mode == SyncMode::Notify;
+    let collect = mode == SyncMode::Collect;
+    // Rows gathered in Collect mode: terminal outcomes this pass, then in-progress.
+    let mut done_rows: Vec<SyncRow> = Vec::new();
+    let mut live_rows: Vec<SyncRow> = Vec::new();
     let mut q = SyncQueue::open()?;
     if print {
-        println!("tracking: {}", syncing_file().display());
+        println!("{} {}", style::dim("tracking:"), syncing_file().display());
     }
     if q.items.is_empty() {
         if print {
-            println!("No ArgoCD syncs in progress.");
+            println!("{} No ArgoCD syncs in progress.", style::ok());
         }
-        return Ok(true);
+        return Ok((true, collect.then(Vec::new)));
     }
 
     let Some(argo_cfg) = config::load_argo()? else {
@@ -711,8 +896,9 @@ fn check_syncing(mode: SyncMode) -> Result<bool> {
                 "no ArgoCD token configured (argocd_token in config.toml); can't check sync status"
             );
         }
-        // Can't make progress without a token; treat as done so we don't spin.
-        return Ok(true);
+        // No token: the TUI shows "none configured" (rows = None), the others
+        // treat it as done so they don't spin.
+        return Ok((true, None));
     };
     let argo = Argo::new(argo_cfg);
 
@@ -720,13 +906,26 @@ fn check_syncing(mode: SyncMode) -> Result<bool> {
     let mut keep = Vec::new();
     let mut done = Vec::new();
     for s in std::mem::take(&mut q.items) {
+        let age = t.saturating_sub(s.started_at);
         // Stop tracking anything that never settles so the list can't grow forever.
-        if t.saturating_sub(s.started_at) > MAX_AGE_SECS {
+        if age > MAX_AGE_SECS {
             done.push(format!(
-                "  gave up   {}  (still not settled after {}m)",
-                s.app,
-                MAX_AGE_SECS / 60
+                "  {} {}  {}",
+                style::err(),
+                style::bold_red("gave up"),
+                style::dim(&format!(
+                    "{}  (still not settled after {}m)",
+                    s.app,
+                    MAX_AGE_SECS / 60
+                ))
             ));
+            done_rows.push(SyncRow {
+                status: SyncState::GaveUp,
+                app: s.app.clone(),
+                detail: format!("not settled after {}m", MAX_AGE_SECS / 60),
+                repo: s.repo.clone(),
+                age_secs: age,
+            });
             if notify {
                 record_history(&s.repo, "SYNC_GAVE_UP", &s.app);
                 notify::send(
@@ -739,13 +938,38 @@ fn check_syncing(mode: SyncMode) -> Result<bool> {
         }
         match argo.status(&s.app) {
             Ok(None) => {
-                done.push(format!("  gone      {}  (no such ArgoCD app)", s.app));
+                done.push(format!(
+                    "  {} {}  {}",
+                    style::err(),
+                    style::dim("gone"),
+                    style::dim(&format!("{}  (no such ArgoCD app)", s.app))
+                ));
+                done_rows.push(SyncRow {
+                    status: SyncState::Gone,
+                    app: s.app.clone(),
+                    detail: "no such ArgoCD app".to_string(),
+                    repo: s.repo.clone(),
+                    age_secs: age,
+                });
                 if notify {
                     record_history(&s.repo, "APP_GONE", &s.app);
                 }
             }
             Ok(Some(st)) if st.is_settled() => {
-                done.push(format!("  synced    {}  ({})", s.app, st.health));
+                done.push(format!(
+                    "  {} {}    {}  {}",
+                    style::ok(),
+                    style::bold_green("synced"),
+                    s.app,
+                    style::dim(&format!("({})", st.health))
+                ));
+                done_rows.push(SyncRow {
+                    status: SyncState::Synced,
+                    app: s.app.clone(),
+                    detail: st.health.clone(),
+                    repo: s.repo.clone(),
+                    age_secs: age,
+                });
                 if notify {
                     record_history(&s.repo, "SYNCED", &s.app);
                     notify::send(
@@ -757,7 +981,20 @@ fn check_syncing(mode: SyncMode) -> Result<bool> {
             }
             Ok(Some(st)) if st.health == "Degraded" => {
                 // A degraded app won't settle on its own; surface it and drop it.
-                done.push(format!("  degraded  {}  ({}/{})", s.app, st.sync, st.health));
+                done.push(format!(
+                    "  {} {}  {}  {}",
+                    style::err(),
+                    style::bold_red("degraded"),
+                    s.app,
+                    style::dim(&format!("({}/{})", st.sync, st.health))
+                ));
+                done_rows.push(SyncRow {
+                    status: SyncState::Degraded,
+                    app: s.app.clone(),
+                    detail: format!("{}/{}", st.sync, st.health),
+                    repo: s.repo.clone(),
+                    age_secs: age,
+                });
                 if notify {
                     record_history(&s.repo, "DEGRADED", &s.app);
                     notify::send(
@@ -774,21 +1011,44 @@ fn check_syncing(mode: SyncMode) -> Result<bool> {
                     format!(", {}", st.phase)
                 };
                 if print {
+                    let status = format!("{}/{}{phase}", st.sync, st.health);
+                    let age = style::dim(&format!("({age}s ago, {})", s.repo));
                     println!(
-                        "  syncing   {:<28} {}/{}{phase}  ({}s ago, {})",
+                        "  {} {}  {:<28} {status}  {age}",
+                        style::busy(),
+                        style::bold_cyan("syncing"),
                         s.app,
-                        st.sync,
-                        st.health,
-                        t.saturating_sub(s.started_at),
-                        s.repo,
                     );
+                }
+                if collect {
+                    live_rows.push(SyncRow {
+                        status: SyncState::Syncing,
+                        app: s.app.clone(),
+                        detail: format!("{}/{}{phase}", st.sync, st.health),
+                        repo: s.repo.clone(),
+                        age_secs: age,
+                    });
                 }
                 keep.push(s);
             }
             Err(e) => {
                 // Keep it; a transient error shouldn't lose the entry.
                 if print {
-                    println!("  ?         {}  (status check failed: {e:#})", s.app);
+                    println!(
+                        "  {} {}  {}",
+                        style::yellow("?"),
+                        s.app,
+                        style::dim(&format!("(status check failed: {e:#})"))
+                    );
+                }
+                if collect {
+                    live_rows.push(SyncRow {
+                        status: SyncState::Unknown,
+                        app: s.app.clone(),
+                        detail: "status check failed".to_string(),
+                        repo: s.repo.clone(),
+                        age_secs: age,
+                    });
                 }
                 keep.push(s);
             }
@@ -803,13 +1063,24 @@ fn check_syncing(mode: SyncMode) -> Result<bool> {
             println!("{line}");
         }
     }
-    if q.items.is_empty() {
+
+    // In Collect mode, hand back the terminal outcomes seen this pass followed
+    // by the apps still syncing, so the TUI can show both briefly.
+    let rows = if collect {
+        done_rows.extend(live_rows);
+        Some(done_rows)
+    } else {
+        None
+    };
+
+    let empty = q.items.is_empty();
+    if empty {
         if print {
-            println!("All tracked ArgoCD syncs have settled.");
+            println!("{} {}", style::ok(), style::bold_green("All tracked ArgoCD syncs have settled."));
         }
-        return Ok(true);
+        return Ok((true, rows));
     }
-    Ok(false)
+    Ok((false, rows))
 }
 
 /// What cron runs: polls every `WATCH_INTERVAL_SECS` for one minute by looping
@@ -1118,13 +1389,6 @@ fn save_items<T: Serialize>(path: &std::path::Path, items: &[T]) -> Result<()> {
     }
 }
 
-/// Clear the terminal and move the cursor home, so the live `sts -S` view
-/// redraws in place instead of scrolling.
-fn clear_screen() {
-    print!("\x1b[2J\x1b[H");
-    let _ = std::io::stdout().flush();
-}
-
 // ---- crontab ----------------------------------------------------------------
 
 fn cron_line() -> Result<String> {
@@ -1220,7 +1484,7 @@ fn now() -> u64 {
 }
 
 /// `2026-10-05T17:21:00Z`, without pulling in a date crate.
-fn utc_now() -> String {
+pub fn utc_now() -> String {
     let t = now();
     let (days, secs) = ((t / 86400) as i64, t % 86400);
     // Howard Hinnant's civil_from_days.

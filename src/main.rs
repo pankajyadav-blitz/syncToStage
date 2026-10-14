@@ -6,13 +6,16 @@ mod history;
 mod jenkins;
 mod jobs;
 mod notify;
+mod style;
+mod tui;
+mod ui;
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, CommandFactory, Parser};
 use clap_complete::Shell;
 use jenkins::Jenkins;
 use jobs::{Job, JobMap};
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -158,40 +161,46 @@ fn main() {
         print_completions(shell);
         Ok(())
     } else if let Some(repo) = cli.retry {
-        build(BuildArgs {
-            repo: Some(repo),
-            no_argo: cli.no_argo,
-            dry_run: cli.dry_run,
-            wait: cli.wait,
-            follow: cli.follow,
-            all: cli.all,
+        with_ui("retry", |ui| {
+            build(ui, BuildArgs {
+                repo: Some(repo),
+                no_argo: cli.no_argo,
+                dry_run: cli.dry_run,
+                wait: cli.wait,
+                follow: cli.follow,
+                all: cli.all,
+            })
         })
     } else if let Some(app_opt) = cli.logs {
         logs(app_opt, cli.repo, cli.namespace, cli.container)
     } else if cli.ship {
-        ship(ShipArgs {
-            from: cli.from,
-            repo: cli.repo,
-            no_build: cli.no_build,
-            no_argo: cli.no_argo,
-            push_branch: cli.push_branch,
-            dry_run: cli.dry_run,
-            yes: cli.yes,
-            wait: cli.wait,
-            follow: cli.follow,
-            all: cli.all,
+        with_ui("ship", |ui| {
+            ship(ui, ShipArgs {
+                from: cli.from,
+                repo: cli.repo,
+                no_build: cli.no_build,
+                no_argo: cli.no_argo,
+                push_branch: cli.push_branch,
+                dry_run: cli.dry_run,
+                yes: cli.yes,
+                wait: cli.wait,
+                follow: cli.follow,
+                all: cli.all,
+            })
         })
     } else if cli.build {
-        build(BuildArgs {
-            repo: cli.repo,
-            no_argo: cli.no_argo,
-            dry_run: cli.dry_run,
-            wait: cli.wait,
-            follow: cli.follow,
-            all: cli.all,
+        with_ui("build", |ui| {
+            build(ui, BuildArgs {
+                repo: cli.repo,
+                no_argo: cli.no_argo,
+                dry_run: cli.dry_run,
+                wait: cli.wait,
+                follow: cli.follow,
+                all: cli.all,
+            })
         })
     } else if cli.jobs {
-        list_jobs(cli.repo, cli.all)
+        with_ui("jobs", |ui| list_jobs(ui, cli.repo, cli.all))
     } else if cli.pending {
         deploy::show()
     } else if cli.sync_status {
@@ -201,11 +210,11 @@ fn main() {
     } else if cli.log {
         deploy::tail_log(200)
     } else if cli.history {
-        history::show(cli.repo.as_deref())
+        with_ui("history", |ui| history::show(ui, cli.repo.as_deref()))
     } else if cli.dashboard {
         deploy::dashboard()
     } else if cli.check {
-        check()
+        with_ui("check", check)
     } else if cli.follow {
         deploy::follow()
     } else {
@@ -213,7 +222,7 @@ fn main() {
         deploy::dashboard()
     };
     if let Err(e) = result {
-        eprintln!("error: {e:#}");
+        eprintln!("{} {e:#}", style::bold_red("error:"));
         std::process::exit(1);
     }
 }
@@ -224,7 +233,30 @@ fn print_completions(shell: Shell) {
     clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
 }
 
-fn ship(a: ShipArgs) -> Result<()> {
+/// Run a command `body` through a [`Ui`](ui::Ui), choosing the full-screen TUI
+/// runner when stdout is a real terminal and the plain-text backend when it is
+/// piped / redirected (so scripting, CI and `--completions` keep working).
+/// `title` labels the TUI runner screen.
+fn with_ui<F>(title: &str, body: F) -> Result<()>
+where
+    F: FnOnce(&mut dyn ui::Ui) -> Result<()>,
+{
+    if std::io::stdout().is_terminal() {
+        // The runner reports whether the command asked to follow; if so, open
+        // the live dashboard on a fresh screen now that the runner has torn
+        // down (two alternate screens can't be nested).
+        let follow = tui::run_command(title, body)?;
+        if follow {
+            deploy::follow()?;
+        }
+        Ok(())
+    } else {
+        let mut term = ui::TermUi::new();
+        body(&mut term)
+    }
+}
+
+fn ship(ui: &mut dyn ui::Ui, a: ShipArgs) -> Result<()> {
     let repo_dir = repo_root()?;
     let source = match &a.from {
         Some(b) => b.clone(),
@@ -234,14 +266,14 @@ fn ship(a: ShipArgs) -> Result<()> {
         if git::current_branch(&repo_dir).ok().as_deref() != Some(STAGE) {
             bail!("check out `{STAGE}` to ship it directly (or pass -f <branch>)");
         }
-        return ship_stage(a, &repo_dir);
+        return ship_stage(ui, a, &repo_dir);
     }
     let source_sha = git::rev(&repo_dir, &format!("refs/heads/{source}"))
         .with_context(|| format!("no local branch named `{source}`"))?;
     let (slug, jobs, jenkins, argo) =
-        prepare_jenkins(&repo_dir, a.repo.clone(), a.no_build, a.no_argo)?;
+        prepare_jenkins(ui, &repo_dir, a.repo.clone(), a.no_build, a.no_argo)?;
 
-    step(&format!("Fetching {REMOTE}/{STAGE}"));
+    ui.step(&format!("Fetching {REMOTE}/{STAGE}"));
     fetch_stage(&repo_dir)?;
     let remote_stage = format!("{REMOTE}/{STAGE}");
     let remote_stage_sha = git::rev(&repo_dir, &remote_stage)
@@ -257,52 +289,52 @@ fn ship(a: ShipArgs) -> Result<()> {
         ],
     )?;
     if incoming.is_empty() {
-        println!("Nothing to merge: {remote_stage} already contains `{source}`.");
+        ui.info(&format!(
+            "Nothing to merge: {remote_stage} already contains `{source}`."
+        ));
         if a.no_build {
-            println!("Nothing to build (-n); stage is already up to date.");
+            ui.info("Nothing to build (-n); stage is already up to date.");
             return Ok(());
         }
         if a.dry_run {
-            println!("Dry run: stage is up to date; would trigger the Jenkins build.");
-            print_jenkins_plan(&slug, &jobs, a.no_build, a.all);
-            print_argo_plan(&jobs, a.no_build, a.no_argo, argo);
+            ui.info("Dry run: stage is up to date; would trigger the Jenkins build.");
+            print_jenkins_plan(ui, &slug, &jobs, a.no_build, a.all);
+            print_argo_plan(ui, &jobs, a.no_build, a.no_argo, argo);
             return Ok(());
         }
-        let jobs = choose_jobs(jobs, a.no_build, a.all)?;
-        println!("Triggering the Jenkins build to rebuild stage anyway.");
-        return finish_build(&slug, jobs, jenkins, a.no_build, argo, a.wait, a.follow);
+        let jobs = choose_jobs(ui, jobs, a.no_build, a.all)?;
+        ui.info("Triggering the Jenkins build to rebuild stage anyway.");
+        return finish_build(ui, &slug, jobs, jenkins, a.no_build, argo, a.wait, a.follow);
     }
 
     // Summary of what is about to happen.
-    println!();
-    println!("  repo      {slug}");
-    println!("  merge     {source} ({})", short(&source_sha));
-    println!("  into      {remote_stage} ({})", short(&remote_stage_sha));
-    print_commits(&incoming);
-    print_diff_summary(&repo_dir, &remote_stage, &format!("refs/heads/{source}"));
-    warn_local_stage(&repo_dir, &remote_stage, &remote_stage_sha)?;
+    ui.detail(&format!("repo    {slug}"));
+    ui.detail(&format!("merge   {source} ({})", short(&source_sha)));
+    ui.detail(&format!("into    {remote_stage} ({})", short(&remote_stage_sha)));
+    print_commits(ui, &incoming);
+    print_diff_summary(ui, &repo_dir, &remote_stage, &format!("refs/heads/{source}"));
+    warn_local_stage(ui, &repo_dir, &remote_stage, &remote_stage_sha)?;
     let dirty = git::run(
         &repo_dir,
         &["status", "--porcelain", "--untracked-files=no"],
     )?;
     if !dirty.is_empty() {
-        println!("  note      uncommitted changes in your working tree are NOT included");
+        ui.detail("note    uncommitted changes in your working tree are NOT included");
     }
-    print_jenkins_plan(&slug, &jobs, a.no_build, a.all);
-    print_argo_plan(&jobs, a.no_build, a.no_argo, argo);
-    println!();
+    print_jenkins_plan(ui, &slug, &jobs, a.no_build, a.all);
+    print_argo_plan(ui, &jobs, a.no_build, a.no_argo, argo);
 
     if a.dry_run {
-        println!("Dry run: nothing merged, pushed or built.");
+        ui.info("Dry run: nothing merged, pushed or built.");
         return Ok(());
     }
-    let jobs = choose_jobs(jobs, a.no_build, a.all)?;
-    if !a.yes && !confirm(&format!("Merge `{source}` into {STAGE} and push?"))? {
+    let jobs = choose_jobs(ui, jobs, a.no_build, a.all)?;
+    if !a.yes && !ui.confirm(&format!("Merge `{source}` into {STAGE} and push?"))? {
         bail!("aborted");
     }
 
     if a.push_branch {
-        step(&format!("Pushing `{source}` to {REMOTE}"));
+        ui.step(&format!("Pushing `{source}` to {REMOTE}"));
         let out = git::try_run(
             &repo_dir,
             &["push", REMOTE, &format!("refs/heads/{source}")],
@@ -312,21 +344,21 @@ fn ship(a: ShipArgs) -> Result<()> {
         }
     }
 
-    let pushed = merge_and_push(&repo_dir, &source, &remote_stage)?;
-    println!("Pushed {STAGE} at {}", short(&pushed));
-    update_local_stage(&repo_dir, &pushed);
+    let pushed = merge_and_push(ui, &repo_dir, &source, &remote_stage)?;
+    ui.ok(&format!("Pushed {STAGE} at {}", short(&pushed)));
+    update_local_stage(ui, &repo_dir, &pushed);
 
-    finish_build(&slug, jobs, jenkins, a.no_build, argo, a.wait, a.follow)
+    finish_build(ui, &slug, jobs, jenkins, a.no_build, argo, a.wait, a.follow)
 }
 
 /// Shipping from `stage` itself: pull origin/stage into the checked-out local
 /// stage, push it back, and build. On a conflict the pull is aborted and
 /// nothing is pushed.
-fn ship_stage(a: ShipArgs, repo_dir: &Path) -> Result<()> {
+fn ship_stage(ui: &mut dyn ui::Ui, a: ShipArgs, repo_dir: &Path) -> Result<()> {
     let (slug, jobs, jenkins, argo) =
-        prepare_jenkins(repo_dir, a.repo.clone(), a.no_build, a.no_argo)?;
+        prepare_jenkins(ui, repo_dir, a.repo.clone(), a.no_build, a.no_argo)?;
 
-    step(&format!("Fetching {REMOTE}/{STAGE}"));
+    ui.step(&format!("Fetching {REMOTE}/{STAGE}"));
     fetch_stage(repo_dir)?;
     let remote_stage = format!("{REMOTE}/{STAGE}");
     let remote_stage_sha = git::rev(repo_dir, &remote_stage)
@@ -339,53 +371,49 @@ fn ship_stage(a: ShipArgs, repo_dir: &Path) -> Result<()> {
     let to_pull = range_log(format!("refs/heads/{STAGE}..{remote_stage}"))?;
     let to_push = range_log(format!("{remote_stage}..refs/heads/{STAGE}"))?;
 
-    println!();
-    println!("  repo      {slug}");
-    println!("  local     {STAGE} ({})", short(&local_sha));
-    println!("  remote    {remote_stage} ({})", short(&remote_stage_sha));
-    println!(
-        "  pull      {} commit(s) from {remote_stage}",
+    ui.detail(&format!("repo    {slug}"));
+    ui.detail(&format!("local   {STAGE} ({})", short(&local_sha)));
+    ui.detail(&format!("remote  {remote_stage} ({})", short(&remote_stage_sha)));
+    ui.detail(&format!(
+        "pull    {} commit(s) from {remote_stage}",
         to_pull.lines().count()
-    );
+    ));
     if to_push.is_empty() {
-        println!("  push      nothing new (local {STAGE} has no commits {remote_stage} lacks)");
+        ui.detail(&format!(
+            "push    nothing new (local {STAGE} has no commits {remote_stage} lacks)"
+        ));
     } else {
-        println!("  push      {} local commit(s):", to_push.lines().count());
+        ui.detail(&format!("push    {} local commit(s):", to_push.lines().count()));
         for l in to_push.lines().take(15) {
-            println!("              {l}");
+            ui.detail(&format!("          {l}"));
         }
     }
-    print_jenkins_plan(&slug, &jobs, a.no_build, a.all);
-    print_argo_plan(&jobs, a.no_build, a.no_argo, argo);
-    println!();
+    print_jenkins_plan(ui, &slug, &jobs, a.no_build, a.all);
+    print_argo_plan(ui, &jobs, a.no_build, a.no_argo, argo);
 
     if a.dry_run {
-        println!("Dry run: nothing pulled, pushed or built.");
+        ui.info("Dry run: nothing pulled, pushed or built.");
         return Ok(());
     }
-    let jobs = choose_jobs(jobs, a.no_build, a.all)?;
-    if !a.yes
-        && !confirm(&format!(
-            "Pull {remote_stage} into {STAGE}, push and build?"
-        ))?
-    {
+    let jobs = choose_jobs(ui, jobs, a.no_build, a.all)?;
+    if !a.yes && !ui.confirm(&format!("Pull {remote_stage} into {STAGE}, push and build?"))? {
         bail!("aborted");
     }
 
-    pull_and_push_stage(repo_dir, &remote_stage)?;
-    finish_build(&slug, jobs, jenkins, a.no_build, argo, a.wait, a.follow)
+    pull_and_push_stage(ui, repo_dir, &remote_stage)?;
+    finish_build(ui, &slug, jobs, jenkins, a.no_build, argo, a.wait, a.follow)
 }
 
 /// Merges origin/stage into the checked-out local stage and pushes it.
 /// Retries if someone else pushed in the meantime. Never force-pushes.
-fn pull_and_push_stage(repo_dir: &Path, remote_stage: &str) -> Result<()> {
+fn pull_and_push_stage(ui: &mut dyn ui::Ui, repo_dir: &Path, remote_stage: &str) -> Result<()> {
     const ATTEMPTS: u32 = 3;
     for attempt in 1..=ATTEMPTS {
         if attempt > 1 {
             fetch_stage(repo_dir)?;
         }
 
-        step(&format!("Pulling {remote_stage} into {STAGE}"));
+        ui.step(&format!("Pulling {remote_stage} into {STAGE}"));
         let merge = git::try_run(repo_dir, &["merge", "--no-edit", remote_stage])?;
         if !merge.ok {
             let conflicts =
@@ -401,7 +429,7 @@ fn pull_and_push_stage(repo_dir: &Path, remote_stage: &str) -> Result<()> {
             );
         }
 
-        step(&format!("Pushing to {REMOTE}/{STAGE}"));
+        ui.step(&format!("Pushing to {REMOTE}/{STAGE}"));
         let push = git::try_run(
             repo_dir,
             &[
@@ -412,11 +440,13 @@ fn pull_and_push_stage(repo_dir: &Path, remote_stage: &str) -> Result<()> {
         )?;
         if push.ok {
             let sha = git::rev(repo_dir, &format!("refs/heads/{STAGE}")).unwrap_or_default();
-            println!("Pushed {STAGE} at {}", short(&sha));
+            ui.ok(&format!("Pushed {STAGE} at {}", short(&sha)));
             return Ok(());
         }
         if push_raced(&push.stderr) && attempt < ATTEMPTS {
-            println!("{STAGE} changed on {REMOTE} while pulling; retrying ({attempt}/{ATTEMPTS})");
+            ui.warn(&format!(
+                "{STAGE} changed on {REMOTE} while pulling; retrying ({attempt}/{ATTEMPTS})"
+            ));
             continue;
         }
         bail!("push to {STAGE} failed:\n{}", push.stderr);
@@ -431,6 +461,7 @@ type Prepared = (String, Option<Vec<Job>>, Option<Jenkins>, bool);
 /// before anything is pushed, so a bad token doesn't leave stage pushed but unbuilt.
 /// The returned bool says whether to sync ArgoCD after the build.
 fn prepare_jenkins(
+    ui: &mut dyn ui::Ui,
     repo_dir: &Path,
     repo: Option<String>,
     no_build: bool,
@@ -439,117 +470,85 @@ fn prepare_jenkins(
     let slug = resolve_slug(repo_dir, repo)?;
     let jobs = JobMap::load()?.lookup(&slug);
     let jenkins = match (&jobs, no_build) {
-        (Some(_), false) => Some(connect().context("use -n to push without building")?),
+        (Some(_), false) => Some(connect(ui).context("use -n to push without building")?),
         _ => None,
     };
-    let argo = jenkins.is_some() && !no_argo && argo_configured()?;
+    let argo = jenkins.is_some() && !no_argo && argo_configured(ui)?;
     Ok((slug, jobs, jenkins, argo))
 }
 
 /// Whether an ArgoCD token is configured; warns (once, up front) when it isn't.
-fn argo_configured() -> Result<bool> {
+fn argo_configured(ui: &mut dyn ui::Ui) -> Result<bool> {
     if config::load_argo()?.is_some() {
         return Ok(true);
     }
-    println!(
-        "note: no `argocd_token` in {}; ArgoCD will not be synced after the build",
+    ui.warn(&format!(
+        "no `argocd_token` in {}; ArgoCD will not be synced after the build",
         config::config_file().display()
-    );
+    ));
     Ok(false)
 }
 
-fn print_argo_plan(jobs: &Option<Vec<Job>>, no_build: bool, no_argo: bool, argo: bool) {
+fn print_argo_plan(ui: &mut dyn ui::Ui, jobs: &Option<Vec<Job>>, no_build: bool, no_argo: bool, argo: bool) {
     if jobs.is_none() || no_build {
         return;
     }
     if no_argo {
-        println!("  argocd    skipped (-A)");
+        ui.detail("argocd  skipped (-A)");
     } else if argo {
-        println!("  argocd    sync each app when its build succeeds (cron, see `sts -P`)");
+        ui.detail("argocd  sync each app when its build succeeds (cron, see `sts -P`)");
     } else {
-        println!("  argocd    skipped (no argocd_token configured)");
+        ui.detail("argocd  skipped (no argocd_token configured)");
     }
 }
 
-fn print_jenkins_plan(slug: &str, jobs: &Option<Vec<Job>>, no_build: bool, all: bool) {
+fn print_jenkins_plan(ui: &mut dyn ui::Ui, slug: &str, jobs: &Option<Vec<Job>>, no_build: bool, all: bool) {
     match (jobs, no_build) {
-        (_, true) => println!("  jenkins   skipped (-n)"),
-        (None, _) => println!("  jenkins   no job mapped for {slug} (see `sts -ja`)"),
+        (_, true) => ui.detail("jenkins skipped (-n)"),
+        (None, _) => ui.detail(&format!("jenkins no job mapped for {slug} (see `sts -ja`)")),
         (Some(jobs), _) if jobs.len() > 1 && !all => {
-            println!("  jenkins   {} job(s), will ask which to trigger (-a for all):", jobs.len());
+            ui.detail(&format!(
+                "jenkins {} job(s), will ask which to trigger (-a for all):",
+                jobs.len()
+            ));
             for j in jobs {
-                println!("              {}", j.raw);
+                ui.detail(&format!("          {}", j.raw));
             }
         }
         (Some(jobs), _) => {
-            println!("  jenkins   {} job(s):", jobs.len());
+            ui.detail(&format!("jenkins {} job(s):", jobs.len()));
             for j in jobs {
-                println!("              {}", j.raw);
+                ui.detail(&format!("          {}", j.raw));
             }
         }
     }
 }
 
-/// When a repo maps to several Jenkins jobs, ask which to trigger (numbers or
-/// job names, comma-separated, or `a` for all); `-a` skips the question. Asked
-/// before anything is pushed, so a bad answer leaves stage untouched.
-fn choose_jobs(jobs: Option<Vec<Job>>, no_build: bool, all: bool) -> Result<Option<Vec<Job>>> {
+/// When a repo maps to several Jenkins jobs, ask which to trigger via the UI's
+/// chooser; `-a` (or a single/zero job, or `-n`) skips the question. Asked
+/// before anything is pushed, so a cancelled choice leaves stage untouched.
+fn choose_jobs(
+    ui: &mut dyn ui::Ui,
+    jobs: Option<Vec<Job>>,
+    no_build: bool,
+    all: bool,
+) -> Result<Option<Vec<Job>>> {
     let Some(jobs) = jobs else {
         return Ok(None);
     };
     if no_build || all || jobs.len() <= 1 {
         return Ok(Some(jobs));
     }
-    if !std::io::stdin().is_terminal() {
-        bail!(
-            "this repo has {} Jenkins jobs; pass -a to trigger all of them",
-            jobs.len()
-        );
-    }
-    println!("This repo has {} Jenkins jobs:", jobs.len());
-    for (i, j) in jobs.iter().enumerate() {
-        println!("  {}. {:<24} {}", i + 1, j.name(), j.raw);
-    }
-    print!(
-        "Trigger which? [1-{}, comma-separated, a = all] ",
-        jobs.len()
-    );
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
-    let picked = parse_job_choice(answer.trim(), &jobs)?;
+    let items = ui::job_items(&jobs);
+    let picked = ui.choose("Trigger which Jenkins job(s)?", &items, true)?;
     Ok(Some(
-        jobs.into_iter()
-            .zip(picked)
-            .filter_map(|(j, p)| p.then_some(j))
-            .collect(),
+        picked.into_iter().map(|i| jobs[i].clone()).collect(),
     ))
 }
 
-/// Which of `jobs` an answer to the "Trigger which?" prompt selects: `a`/`all`,
-/// or 1-based numbers and job names separated by commas or spaces.
-fn parse_job_choice(answer: &str, jobs: &[Job]) -> Result<Vec<bool>> {
-    if answer.is_empty() {
-        bail!("aborted: no job chosen");
-    }
-    if matches!(answer.to_lowercase().as_str(), "a" | "all") {
-        return Ok(vec![true; jobs.len()]);
-    }
-    let mut picked = vec![false; jobs.len()];
-    for tok in answer.split([',', ' ']).filter(|t| !t.is_empty()) {
-        let i = match tok.parse::<usize>() {
-            Ok(i) if (1..=jobs.len()).contains(&i) => i - 1,
-            _ => jobs
-                .iter()
-                .position(|j| j.name() == tok)
-                .with_context(|| format!("`{tok}` is not one of the listed jobs"))?,
-        };
-        picked[i] = true;
-    }
-    Ok(picked)
-}
-
+#[allow(clippy::too_many_arguments)]
 fn finish_build(
+    ui: &mut dyn ui::Ui,
     slug: &str,
     jobs: Option<Vec<Job>>,
     jenkins: Option<Jenkins>,
@@ -559,15 +558,15 @@ fn finish_build(
     follow: bool,
 ) -> Result<()> {
     if no_build {
-        println!("Pushed to {STAGE}; build not triggered (-n).");
+        ui.info(&format!("Pushed to {STAGE}; build not triggered (-n)."));
         return Ok(());
     }
     match (jobs, jenkins) {
-        (Some(jobs), Some(jenkins)) => trigger_all(&jenkins, slug, &jobs, argo, wait, follow),
+        (Some(jobs), Some(jenkins)) => trigger_all(ui, &jenkins, slug, &jobs, argo, wait, follow),
         _ => {
-            println!(
+            ui.info(&format!(
                 "Pushed to {STAGE}, but no Jenkins job is mapped for {slug}; build not triggered."
-            );
+            ));
             Ok(())
         }
     }
@@ -602,7 +601,12 @@ fn fetch_stage(repo_dir: &Path) -> Result<()> {
 
 /// Merges `source` onto a fresh copy of origin/stage in a temp worktree and pushes it.
 /// Retries if someone else pushed to stage in the meantime. Never force-pushes.
-fn merge_and_push(repo_dir: &Path, source: &str, remote_stage: &str) -> Result<String> {
+fn merge_and_push(
+    ui: &mut dyn ui::Ui,
+    repo_dir: &Path,
+    source: &str,
+    remote_stage: &str,
+) -> Result<String> {
     const ATTEMPTS: u32 = 3;
     let wt = git::TempWorktree::create(repo_dir, remote_stage)?;
     let message = format!("Merge branch '{source}' into {STAGE}");
@@ -614,7 +618,7 @@ fn merge_and_push(repo_dir: &Path, source: &str, remote_stage: &str) -> Result<S
             wt.reset_to(remote_stage)?;
         }
 
-        step(&format!("Merging `{source}` into {remote_stage}"));
+        ui.step(&format!("Merging `{source}` into {remote_stage}"));
         let merge = git::try_run(
             &wt.path,
             &["merge", "--no-ff", "--no-edit", "-m", &message, &source_ref],
@@ -640,7 +644,7 @@ fn merge_and_push(repo_dir: &Path, source: &str, remote_stage: &str) -> Result<S
             );
         }
 
-        step(&format!("Pushing to {REMOTE}/{STAGE}"));
+        ui.step(&format!("Pushing to {REMOTE}/{STAGE}"));
         let push = git::try_run(
             &wt.path,
             &["push", REMOTE, &format!("HEAD:refs/heads/{STAGE}")],
@@ -649,7 +653,9 @@ fn merge_and_push(repo_dir: &Path, source: &str, remote_stage: &str) -> Result<S
             return git::rev(&wt.path, "HEAD").context("reading merged commit");
         }
         if push_raced(&push.stderr) && attempt < ATTEMPTS {
-            println!("{STAGE} changed on {REMOTE} while merging; retrying ({attempt}/{ATTEMPTS})");
+            ui.warn(&format!(
+                "{STAGE} changed on {REMOTE} while merging; retrying ({attempt}/{ATTEMPTS})"
+            ));
             continue;
         }
         bail!("push to {STAGE} failed:\n{}", push.stderr);
@@ -657,7 +663,7 @@ fn merge_and_push(repo_dir: &Path, source: &str, remote_stage: &str) -> Result<S
     unreachable!()
 }
 
-fn build(a: BuildArgs) -> Result<()> {
+fn build(ui: &mut dyn ui::Ui, a: BuildArgs) -> Result<()> {
     let slug = match a.repo {
         Some(r) => r,
         None => match repo_root() {
@@ -667,19 +673,23 @@ fn build(a: BuildArgs) -> Result<()> {
     };
     let map = JobMap::load()?;
     let Some(jobs) = map.lookup(&slug) else {
-        println!("No Jenkins job is mapped for {slug}; nothing to trigger.");
+        ui.info(&format!("No Jenkins job is mapped for {slug}; nothing to trigger."));
         return Ok(());
     };
     if a.dry_run {
         if jobs.len() > 1 && !a.all {
-            println!("Would ask which of {} job(s) to trigger for {slug} (-a for all):", jobs.len());
+            ui.info(&format!(
+                "Would ask which of {} job(s) to trigger for {slug} (-a for all):",
+                jobs.len()
+            ));
         } else {
-            println!("Would trigger {} job(s) for {slug}:", jobs.len());
+            ui.info(&format!("Would trigger {} job(s) for {slug}:", jobs.len()));
         }
         for j in &jobs {
-            println!("  {}", j.raw);
+            ui.detail(&j.raw);
         }
         print_argo_plan(
+            ui,
             &Some(jobs),
             false,
             a.no_argo,
@@ -687,13 +697,14 @@ fn build(a: BuildArgs) -> Result<()> {
         );
         return Ok(());
     }
-    let jobs = choose_jobs(Some(jobs), false, a.all)?.unwrap_or_default();
-    let jenkins = connect()?;
-    let argo = !a.no_argo && argo_configured()?;
-    trigger_all(&jenkins, &slug, &jobs, argo, a.wait, a.follow)
+    let jobs = choose_jobs(ui, Some(jobs), false, a.all)?.unwrap_or_default();
+    let jenkins = connect(ui)?;
+    let argo = !a.no_argo && argo_configured(ui)?;
+    trigger_all(ui, &jenkins, &slug, &jobs, argo, a.wait, a.follow)
 }
 
 fn trigger_all(
+    ui: &mut dyn ui::Ui,
     jenkins: &Jenkins,
     slug: &str,
     jobs: &[Job],
@@ -701,18 +712,18 @@ fn trigger_all(
     wait: u64,
     follow: bool,
 ) -> Result<()> {
-    step(&format!("Triggering {} Jenkins job(s)", jobs.len()));
+    ui.step(&format!("Triggering {} Jenkins job(s)", jobs.len()));
     let mut queued = Vec::new();
     let mut failed = 0;
     for job in jobs {
         match jenkins.trigger(job) {
             Ok(q) => {
-                println!("  queued   {}", job.raw);
+                ui.ok(&format!("queued  {}", job.raw));
                 queued.push((job, q));
             }
             Err(e) => {
                 failed += 1;
-                println!("  FAILED   {}\n           {e:#}", job.raw);
+                ui.err(&format!("FAILED  {}\n           {e:#}", job.raw));
             }
         }
     }
@@ -725,9 +736,9 @@ fn trigger_all(
             _ => None,
         };
         match &build {
-            Some(url) => println!("  started  {url}console"),
-            None if wait > 0 => println!("  waiting  {} (still queued)", q.job_url),
-            None => println!("  job      {}", q.job_url),
+            Some(url) => ui.ok(&format!("started  {url}console")),
+            None if wait > 0 => ui.detail(&format!("waiting  {} (still queued)", q.job_url)),
+            None => ui.detail(&format!("job      {}", q.job_url)),
         }
         if q.queue_url.is_some() || build.is_some() {
             pending.push(deploy::Pending::new(
@@ -738,22 +749,22 @@ fn trigger_all(
                 build,
             ));
         } else if argo {
-            println!(
-                "  note     Jenkins gave no queue URL for {}; ArgoCD sync not scheduled",
+            ui.detail(&format!(
+                "note     Jenkins gave no queue URL for {}; ArgoCD sync not scheduled",
                 job.raw
-            );
+            ));
         }
     }
 
     let scheduled = argo && !pending.is_empty();
     if scheduled {
         match deploy::enqueue(pending) {
-            Ok(()) => println!(
-                "ArgoCD sync scheduled: cron checks every minute and syncs when the build succeeds \
-                 (`sts -P` to see it, log: {})",
+            Ok(()) => ui.ok(&format!(
+                "ArgoCD sync scheduled: cron checks every minute and syncs when the build \
+                 succeeds (`sts -P` to see it, log: {})",
                 deploy::log_file().display()
-            ),
-            Err(e) => println!("warning: could not schedule the ArgoCD sync: {e:#}"),
+            )),
+            Err(e) => ui.warn(&format!("could not schedule the ArgoCD sync: {e:#}")),
         }
     }
 
@@ -765,12 +776,18 @@ fn trigger_all(
         );
     }
 
-    // -F/--follow: block here and watch the build + sync through to completion
-    // instead of handing off to cron. Only meaningful when a sync was scheduled.
+    // -F/--follow: watch the build + sync through to completion. The follow
+    // view is its own full-screen dashboard, so inside the TUI runner we can't
+    // nest it — instead we ask the runner to open it after it tears down. On
+    // the plain path we block inline as before.
     if follow && scheduled {
-        println!();
-        step("Following the build + ArgoCD sync (Ctrl-C to detach; cron keeps watching)");
-        deploy::follow()?;
+        if ui.is_tui() {
+            ui.info("Following the build + ArgoCD sync — opening the live dashboard…");
+            ui.request_follow();
+        } else {
+            ui.step("Following the build + ArgoCD sync (Ctrl-C to detach; cron keeps watching)");
+            deploy::follow()?;
+        }
     }
     Ok(())
 }
@@ -801,14 +818,14 @@ fn logs(
 }
 
 
-fn list_jobs(repo: Option<String>, all: bool) -> Result<()> {
+fn list_jobs(ui: &mut dyn ui::Ui, repo: Option<String>, all: bool) -> Result<()> {
     let map = JobMap::load()?;
-    println!("mapping: {}", map.source);
+    ui.detail(&format!("mapping: {}", map.source));
     if all {
         for (repo, paths) in map.all() {
-            println!("{repo}");
+            ui.info(repo);
             for p in paths {
-                println!("  {p}");
+                ui.detail(p);
             }
         }
         return Ok(());
@@ -819,44 +836,44 @@ fn list_jobs(repo: Option<String>, all: bool) -> Result<()> {
     };
     match map.lookup(&slug) {
         Some(jobs) => {
-            println!("{slug}");
+            ui.info(&slug);
             for j in jobs {
-                println!("  {}", j.raw);
+                ui.detail(&j.raw);
             }
         }
-        None => println!("No Jenkins job is mapped for {slug}."),
+        None => ui.info(&format!("No Jenkins job is mapped for {slug}.")),
     }
     Ok(())
 }
 
-fn check() -> Result<()> {
-    println!("config: {}", config::config_file().display());
-    connect()?;
+fn check(ui: &mut dyn ui::Ui) -> Result<()> {
+    ui.detail(&format!("config: {}", config::config_file().display()));
+    connect(ui)?;
     match config::load_argo()? {
         Some(cfg) => {
             let argo = argocd::Argo::new(cfg);
             let who = argo.whoami()?;
-            println!("ArgoCD {} as {who}", argo.url());
+            ui.ok(&format!("ArgoCD {} as {who}", argo.url()));
         }
-        None => println!("ArgoCD: no argocd_token configured; builds won't be synced"),
+        None => ui.warn("ArgoCD: no argocd_token configured; builds won't be synced"),
     }
     let map = JobMap::load()?;
-    println!("mapping: {}", map.source);
+    ui.detail(&format!("mapping: {}", map.source));
     if let Ok(dir) = repo_root()
         && let Ok(slug) = git::repo_slug(&dir, REMOTE)
     {
         match map.lookup(&slug) {
-            Some(jobs) => println!("this repo: {slug} -> {} job(s)", jobs.len()),
-            None => println!("this repo: {slug} -> no job mapped"),
+            Some(jobs) => ui.info(&format!("this repo: {slug} -> {} job(s)", jobs.len())),
+            None => ui.info(&format!("this repo: {slug} -> no job mapped")),
         }
     }
     Ok(())
 }
 
-fn connect() -> Result<Jenkins> {
+fn connect(ui: &mut dyn ui::Ui) -> Result<Jenkins> {
     let jenkins = Jenkins::new(config::load()?);
     let who = jenkins.whoami()?;
-    println!("Jenkins {} as {who}", jenkins.url());
+    ui.ok(&format!("Jenkins {} as {who}", jenkins.url()));
     Ok(jenkins)
 }
 
@@ -875,7 +892,12 @@ fn resolve_slug(repo_dir: &Path, explicit: Option<String>) -> Result<String> {
 }
 
 /// Local `stage` is reset to whatever we push, so warn about commits only it has.
-fn warn_local_stage(repo_dir: &Path, remote_stage: &str, remote_sha: &str) -> Result<()> {
+fn warn_local_stage(
+    ui: &mut dyn ui::Ui,
+    repo_dir: &Path,
+    remote_stage: &str,
+    remote_sha: &str,
+) -> Result<()> {
     let Some(local) = git::rev(repo_dir, &format!("refs/heads/{STAGE}")) else {
         return Ok(());
     };
@@ -893,18 +915,18 @@ fn warn_local_stage(repo_dir: &Path, remote_stage: &str, remote_sha: &str) -> Re
     )?;
     if !only_local.is_empty() {
         let n = only_local.lines().count();
-        println!(
-            "  warning   local `{STAGE}` has {n} commit(s) not on {remote_stage}; they will be dropped"
-        );
-        println!(
-            "            (local {STAGE} is at {}; recover with `git branch {STAGE}-backup {local}`)",
+        ui.warn(&format!(
+            "local `{STAGE}` has {n} commit(s) not on {remote_stage}; they will be dropped"
+        ));
+        ui.detail(&format!(
+            "(local {STAGE} is at {}; recover with `git branch {STAGE}-backup {local}`)",
             short(&local)
-        );
+        ));
     }
     Ok(())
 }
 
-fn update_local_stage(repo_dir: &Path, sha: &str) {
+fn update_local_stage(ui: &mut dyn ui::Ui, repo_dir: &Path, sha: &str) {
     match git::try_run(repo_dir, &["branch", "--force", STAGE, sha]) {
         Ok(o) if o.ok => {
             let _ = git::try_run(
@@ -917,24 +939,24 @@ fn update_local_stage(repo_dir: &Path, sha: &str) {
                 ],
             );
         }
-        Ok(o) => println!(
-            "note: local `{STAGE}` not updated ({}); where it is checked out, run \
+        Ok(o) => ui.warn(&format!(
+            "local `{STAGE}` not updated ({}); where it is checked out, run \
              `git reset --hard {REMOTE}/{STAGE}`",
             o.stderr.lines().last().unwrap_or("").trim()
-        ),
+        )),
         Err(_) => {}
     }
 }
 
-fn print_commits(log: &str) {
+fn print_commits(ui: &mut dyn ui::Ui, log: &str) {
     const SHOW: usize = 15;
     let lines: Vec<&str> = log.lines().collect();
-    println!("  commits   {} new on stage:", lines.len());
+    ui.detail(&format!("commits {} new on stage:", lines.len()));
     for l in lines.iter().take(SHOW) {
-        println!("              {l}");
+        ui.detail(&format!("          {l}"));
     }
     if lines.len() > SHOW {
-        println!("              ... and {} more", lines.len() - SHOW);
+        ui.detail(&format!("          ... and {} more", lines.len() - SHOW));
     }
 }
 
@@ -942,30 +964,15 @@ fn print_commits(log: &str) {
 /// merge would bring onto stage, from `git diff --shortstat base...tip`. The
 /// three-dot range diffs tip against the merge base, matching what will land.
 /// Best-effort: silent on error.
-fn print_diff_summary(repo_dir: &Path, base: &str, tip: &str) {
+fn print_diff_summary(ui: &mut dyn ui::Ui, repo_dir: &Path, base: &str, tip: &str) {
     let range = format!("{base}...{tip}");
     if let Ok(stat) = git::run(repo_dir, &["diff", "--shortstat", &range]) {
         let stat = stat.trim();
         if !stat.is_empty() {
             // e.g. "8 files changed, 312 insertions(+), 45 deletions(-)"
-            println!("  diff      {stat}");
+            ui.detail(&format!("diff    {stat}"));
         }
     }
-}
-
-fn confirm(question: &str) -> Result<bool> {
-    if !std::io::stdin().is_terminal() {
-        bail!("stdin is not a terminal; pass -y to skip the confirmation");
-    }
-    print!("{question} [y/N] ");
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
-    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
-}
-
-fn step(msg: &str) {
-    println!("==> {msg}");
 }
 
 fn short(sha: &str) -> &str {
@@ -983,22 +990,17 @@ fn indent(text: &str) -> String {
 mod tests {
     use super::*;
 
-    fn jobs() -> Vec<Job> {
-        ["app", "dash", "web"]
+    /// The job chooser maps selected indices back to the right jobs; the choice
+    /// parsing itself is tested in `ui::tests`.
+    #[test]
+    fn job_items_pair_name_and_raw() {
+        let jobs: Vec<Job> = ["app", "dash"]
             .iter()
             .map(|n| Job::parse(&format!("/job/stage/job/x/job/x-{n}/build")))
-            .collect()
-    }
-
-    #[test]
-    fn job_choice_by_number_name_or_all() {
-        let j = jobs();
-        assert_eq!(parse_job_choice("2", &j).unwrap(), [false, true, false]);
-        assert_eq!(parse_job_choice("3, 1", &j).unwrap(), [true, false, true]);
-        assert_eq!(parse_job_choice("x-dash x-web", &j).unwrap(), [false, true, true]);
-        assert_eq!(parse_job_choice("A", &j).unwrap(), [true, true, true]);
-        assert!(parse_job_choice("", &j).is_err());
-        assert!(parse_job_choice("4", &j).is_err());
-        assert!(parse_job_choice("nope", &j).is_err());
+            .collect();
+        let items = ui::job_items(&jobs);
+        assert_eq!(items[0].0, "x-app");
+        assert_eq!(items[0].1, "/job/stage/job/x/job/x-app/build");
+        assert_eq!(items[1].0, "x-dash");
     }
 }
