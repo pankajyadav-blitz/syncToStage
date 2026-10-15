@@ -18,7 +18,20 @@ use std::io::IsTerminal;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Set while a full-screen TUI owns the terminal (e.g. `sts --follow`). While it
+/// is active, `log()` must not `println!` — that would scribble over the ratatui
+/// frame. Instead log lines are appended to `watch.log`, which is where cron's
+/// output goes anyway, so nothing is lost.
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Mark the TUI as active or not. Called by the TUI runner around its event loop
+/// so inline watcher ticks (which call `log()`) don't corrupt the screen.
+pub fn set_tui_active(active: bool) {
+    TUI_ACTIVE.store(active, Ordering::SeqCst);
+}
 
 const CRON_MARK: &str = "# sts-watch";
 /// Give up on a build that hasn't finished (or a sync that keeps failing) after this long.
@@ -1337,6 +1350,17 @@ fn deploy(jenkins: &Jenkins, argo: &Argo, apps: &[App], p: &Pending) -> Result<(
 }
 
 fn log(msg: &str) {
+    // While a TUI owns the screen (e.g. `sts --follow` running inline watcher
+    // ticks), printing to stdout would corrupt the ratatui frame. Append to the
+    // watch log instead — the same place cron's output lands — so the message
+    // is kept without scribbling over the UI.
+    if TUI_ACTIVE.load(Ordering::SeqCst) {
+        let line = format!("{} {msg}\n", utc_now());
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_file()) {
+            let _ = f.write_all(line.as_bytes());
+        }
+        return;
+    }
     println!("{} {msg}", utc_now());
 }
 

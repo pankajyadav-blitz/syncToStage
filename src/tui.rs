@@ -98,7 +98,9 @@ where
     C: FnMut() -> Result<Snapshot>,
 {
     let mut terminal = ratatui::try_init()?;
+    crate::deploy::set_tui_active(true);
     let result = run_loop(&mut terminal, view, &mut refresh, &mut collect);
+    crate::deploy::set_tui_active(false);
     ratatui::try_restore()?;
     result
 }
@@ -510,6 +512,7 @@ impl TuiUi {
         F: FnOnce(&mut TuiUi) -> Result<()>,
     {
         let terminal = ratatui::try_init()?;
+        crate::deploy::set_tui_active(true);
         let mut ui = TuiUi {
             terminal,
             title: title.to_string(),
@@ -520,6 +523,7 @@ impl TuiUi {
         let result = body(&mut ui);
         let follow = result.is_ok() && ui.follow_requested;
         let hold = ui.finish(&result);
+        crate::deploy::set_tui_active(false);
         ratatui::try_restore()?;
         hold?;
         result?;
