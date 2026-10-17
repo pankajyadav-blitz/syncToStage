@@ -3,6 +3,7 @@
 //! in the state dir, capped at the most recent `MAX_ENTRIES`.
 
 use crate::config;
+use crate::ui::StepKind;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -80,17 +81,29 @@ pub fn show(ui: &mut dyn crate::ui::Ui, filter: Option<&str>) -> Result<()> {
             return Ok(());
         }
     }
-    ui.detail(&format!("history: {}", history_file().display()));
+    ui.step(&format!(
+        "{} recent deploy(s){}",
+        items.len(),
+        filter.map(|f| format!(" for `{f}`")).unwrap_or_default()
+    ));
     for r in items.iter().rev() {
-        let line = format!("{:<9} {:<28} {}  ({})", r.result, r.repo, ago(r.at), r.detail);
-        // Colour the outcome: successes green, failures red, the rest neutral.
-        match r.result.as_str() {
-            "SUCCESS" | "SYNCED" => ui.ok(&line),
-            "FAILURE" | "ABORTED" | "CANCELLED" | "GAVE_UP" | "SYNC_FAILED" | "DEGRADED"
-            | "LOST" => ui.err(&line),
-            _ => ui.info(&line),
-        }
+        // The outcome is the row's label (lowercased so it reads as a status,
+        // not a shout), coloured green/red by what it means; the rest is an
+        // aligned repo column, then what it was about and when.
+        let kind = match r.result.as_str() {
+            "SUCCESS" | "SYNCED" => StepKind::Ok,
+            "FAILURE" | "ABORTED" | "CANCELLED" | "GAVE_UP" | "SYNC_FAILED" | "SYNC_GAVE_UP"
+            | "DEGRADED" | "LOST" | "APP_GONE" => StepKind::Err,
+            _ => StepKind::Info,
+        };
+        let label = r.result.to_lowercase().replace('_', " ");
+        ui.row(
+            kind,
+            &label,
+            &format!("{:<28} {:<10} {}", r.repo, ago(r.at), r.detail),
+        );
     }
+    ui.kv("history", &history_file().display().to_string());
     Ok(())
 }
 

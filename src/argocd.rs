@@ -18,6 +18,7 @@ pub struct App {
 }
 
 /// A running pod of an ArgoCD app, from its resource tree.
+#[derive(Clone)]
 pub struct Pod {
     pub name: String,
     pub namespace: String,
@@ -26,7 +27,10 @@ pub struct Pod {
 }
 
 /// One line of container output from the logs API. `ts` is the raw RFC3339
-/// timestamp ArgoCD attaches, used to drop lines we have already printed.
+/// timestamp ArgoCD attaches — the nanosecond form when it sends one, since the
+/// second-resolution form can't tell apart lines logged in the same second, and
+/// the caller uses it to drop lines it has already shown.
+#[derive(Clone, PartialEq)]
 pub struct LogLine {
     pub ts: String,
     pub content: String,
@@ -318,14 +322,23 @@ fn parse_log_stream(body: &str) -> Vec<LogLine> {
             continue;
         };
         let r = &v["result"];
+        // Every response ends with an end-of-stream marker: empty content,
+        // `last: true`, and a timestamp of *now*. It is not log output — shown
+        // as-is it was a blank line per pod per poll, and its fresh timestamp
+        // pushed the caller's cursor past real lines, hiding them.
+        if r["last"].as_bool() == Some(true) {
+            continue;
+        }
         let Some(content) = r["content"].as_str() else {
             continue;
         };
         out.push(LogLine {
-            // ArgoCD spells it `timeStamp`; fall back to `timeStampStr`.
-            ts: r["timeStamp"]
+            // Prefer `timeStampStr` (nanoseconds) over `timeStamp` (seconds):
+            // a chatty service logs several lines a second, and a
+            // second-resolution cursor can't tell them apart.
+            ts: r["timeStampStr"]
                 .as_str()
-                .or_else(|| r["timeStampStr"].as_str())
+                .or_else(|| r["timeStamp"].as_str())
                 .unwrap_or("")
                 .to_string(),
             content: content.trim_end_matches('\n').to_string(),
@@ -421,17 +434,35 @@ cicd/helm/stage-argocd-helm/other/Chart.yaml\n";
 
     #[test]
     fn parses_argocd_log_stream() {
+        // Field names, ordering and the trailing marker are copied from a real
+        // response from the stage ArgoCD.
         let body = "\
-{\"result\":{\"content\":\"line one\",\"timeStamp\":\"2026-10-08T08:00:00Z\",\"podName\":\"web-1\"}}\n\
+{\"result\":{\"content\":\"line one\",\"timeStamp\":\"2026-10-08T08:00:00Z\",\"timeStampStr\":\"2026-10-08T08:00:00.123456789Z\",\"last\":false,\"podName\":\"web-1\"}}\n\
 \n\
-{\"result\":{\"content\":\"line two\\n\",\"timeStamp\":\"2026-10-08T08:00:01Z\",\"podName\":\"web-1\"}}\n\
+{\"result\":{\"content\":\"line two\\n\",\"timeStamp\":\"2026-10-08T08:00:01Z\",\"timeStampStr\":\"2026-10-08T08:00:01.987654321Z\",\"last\":false,\"podName\":\"web-1\"}}\n\
 not json\n\
-{\"result\":{\"last\":true}}\n";
+{\"result\":{\"content\":\"\",\"timeStamp\":\"2026-10-08T08:00:02Z\",\"last\":true,\"timeStampStr\":\"2026-10-08T08:00:02.5Z\",\"podName\":\"\"}}\n";
         let lines = parse_log_stream(body);
-        assert_eq!(lines.len(), 2);
+        // The end-of-stream marker is not output and must not appear.
+        assert_eq!(lines.len(), 2, "the `last` marker must be dropped");
         assert_eq!(lines[0].content, "line one");
-        assert_eq!(lines[0].ts, "2026-10-08T08:00:00Z");
+        // The nanosecond timestamp is the cursor, so same-second lines differ.
+        assert_eq!(lines[0].ts, "2026-10-08T08:00:00.123456789Z");
         assert_eq!(lines[1].content, "line two"); // trailing newline trimmed
+    }
+
+    #[test]
+    fn a_blank_line_the_container_printed_is_kept() {
+        // Only the marker is dropped; a genuinely empty log line is output and
+        // `kubectl logs` would show it too.
+        let body = "{\"result\":{\"content\":\"\",\"timeStamp\":\"2026-10-08T08:00:00Z\",\"last\":false}}\n";
+        assert_eq!(parse_log_stream(body).len(), 1);
+    }
+
+    #[test]
+    fn falls_back_to_the_second_resolution_timestamp() {
+        let body = "{\"result\":{\"content\":\"x\",\"timeStamp\":\"2026-10-08T08:00:00Z\"}}\n";
+        assert_eq!(parse_log_stream(body)[0].ts, "2026-10-08T08:00:00Z");
     }
 
     #[test]

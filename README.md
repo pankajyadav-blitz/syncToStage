@@ -43,6 +43,24 @@ entry (tagged `# sts-watch`) runs `sts --watch` every minute. Each run:
 - on `FAILURE`/`ABORTED`/cancelled, drops it without deploying;
 - retries a failed sync up to 3 times, and gives up on builds older than 4 hours.
 
+Each build in the queue is shown as what it is actually doing. The stage Jenkins
+has a handful of executors, so triggering several jobs at once means some of them
+wait:
+
+- `queued` — accepted by Jenkins, no build number yet (it shows Jenkins' own
+  reason, e.g. "Waiting for next available executor");
+- `waiting` — numbered, but parked waiting for a free executor. Jenkins calls
+  this "building" and its clock is already running, so sts shows the time spent
+  in the queue instead of a progress bar that would creep to "overdue" while
+  nothing is happening;
+- `building` — really executing. The bar tracks the pipeline's stages when the
+  stage view is available (`stage 4/6 Build & Push Docker Image`). How many
+  stages there are comes from the job's last finished build: a running build's
+  stage view only lists the stages it has reached, so counting those would read
+  as "1 of 2 done" the moment the second stage starts. Without a stage view the
+  bar falls back to elapsed-versus-estimate, and once past the estimate it
+  becomes indeterminate rather than claiming to be nearly done.
+
 When nothing is pending, the crontab entry removes itself. `sts -P` shows the queue;
 on a terminal it refreshes in place every few seconds, dropping each build as the
 watcher deploys it, and exits once the queue is empty. Piped or redirected it prints
@@ -61,9 +79,16 @@ after 30 minutes.
 
 `sts -l <app>` streams an ArgoCD app's container logs straight from the ArgoCD
 API — no `kubectl`, cluster context or pod names needed. It finds the app's pods
-from its resource tree, then polls their logs every 2 seconds and **appends only
-the new lines** to the terminal (it never clears or redraws the screen), so it
-scrolls like `kubectl logs -f`. Ctrl-C to stop.
+from its resource tree and polls their logs every 2 seconds.
+
+On a terminal this opens a log viewer: it follows new output, but you can scroll
+back through it (`↑↓`, `pgup`/`pgdn`, `g`/`G`), pause and resume following (`f`),
+wrap long lines (`w`) and leave with `q`. Scrolling up pauses by itself, like
+`less`; the footer says whether it is following or paused and where you are. With
+several pods, each line is prefixed with the part of the pod name that tells them
+apart. Colours the container emits are kept; control characters that would
+corrupt the screen are not. Piped or redirected, it appends raw lines to stdout
+instead, so `sts -l app | grep …` still works like `kubectl logs -f`.
 
 The app name is optional. Run `sts -l` with no argument inside a repo and it
 auto-detects the app the same way the deploy watcher does: the repo's Jenkins
@@ -112,7 +137,7 @@ Short flags combine: `-sy`, `-sd`, `-sny`, `-sa`, `-ja`.
 | `-S, --sync-status` | show ArgoCD apps still syncing (drops each once Synced + Healthy) |
 | `-l, --logs [app]` | tail an ArgoCD app's logs (auto-detects the app from the repo if omitted; polls every 2s) |
 | `-D, --dashboard` | combined live view of pending builds + syncing apps |
-| `-L, --log` | tail the watch log |
+| `-L, --log` | the watch log in the same viewer (piped: last 200 lines) |
 | `-H, --history` | show recent deploy history (filter with `-r`) |
 | `-W, --watch` | run one watcher tick (what cron runs) |
 | `--retry <owner/name>` | re-trigger a dropped build for a repo |
@@ -147,8 +172,11 @@ Common combinations:
 - `sts -ja` — list jobs for every mapped repo
 
 On a terminal, `sts`, `-P`, `-S`, `-D` and `--follow` stay up and refresh in place
-until their queue empties (Ctrl-C to exit); piped or redirected they print a single
-snapshot.
+until their queue empties (`q` to exit); piped or redirected they print a single
+snapshot. With nothing in flight they don't open a screen at all — they just say so.
+If a list is longer than the window, the dashboards show how many rows are hidden,
+and the one-shot commands (`-s`, `-b`, `-c`, `-j`, `-H`) can be scrolled once they
+finish (`↑↓`, `pgup`/`pgdn`, `g`/`G`, `q` to exit).
 
 ## Setup
 

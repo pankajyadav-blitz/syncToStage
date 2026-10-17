@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::IsTerminal;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -98,6 +98,17 @@ impl Pending {
             .clone()
             .unwrap_or_else(|| self.job_url.clone())
     }
+}
+
+/// Jenkins build number out of a build URL (`…/job/x/1423/` → `1423`). None for
+/// anything that doesn't end in a numeric path segment.
+pub fn build_number(build_url: &str) -> Option<u64> {
+    build_url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// The pending queue, held under an exclusive file lock for as long as it lives.
@@ -266,8 +277,12 @@ pub fn enqueue(entries: Vec<Pending>) -> Result<()> {
 /// a display state. Produced by `collect_builds` and rendered either as a plain
 /// snapshot (piped) or in the ratatui TUI (on a terminal).
 pub struct BuildRow {
-    /// "building" or "queued".
+    /// What the build is doing: queued, waiting for an executor, or building.
     pub state: BuildState,
+    /// Job name, e.g. `soochi-dash-app` — the row's identity.
+    pub job: String,
+    /// Jenkins build number, once the build has left the queue.
+    pub build: Option<u64>,
     /// Build/job URL (the clickable thing).
     pub label: String,
     pub repo: String,
@@ -277,11 +292,20 @@ pub struct BuildRow {
     pub elapsed: Option<u64>,
     /// Jenkins' estimate of total build time in seconds, if known.
     pub estimated: Option<u64>,
+    /// Which pipeline stage it is on, when Jenkins' stage view knows.
+    pub stage: Option<crate::jenkins::Stage>,
+    /// Why it hasn't started, in Jenkins' words, for a waiting row.
+    pub why: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum BuildState {
+    /// Accepted by Jenkins but not yet given a build number.
     Queued,
+    /// Has a build number, but no executor is running it yet — so its elapsed
+    /// time is queue time, not build time.
+    Waiting,
+    /// Actually executing.
     Building,
 }
 
@@ -302,6 +326,9 @@ impl BuildsView {
 pub struct SyncRow {
     pub status: SyncState,
     pub app: String,
+    /// The app's ArgoCD URL, shown in the dashboard's right-hand gutter so the
+    /// row is clickable the way a build row's Jenkins URL is.
+    pub url: String,
     /// e.g. "Synced/Healthy" or "OutOfSync/Progressing, Running".
     pub detail: String,
     pub repo: String,
@@ -357,17 +384,31 @@ fn collect_builds() -> Result<BuildsView> {
                 (Some(url), Some(j)) => j.build_progress(url),
                 _ => None,
             };
+            // A build with no number is queued; one that has a number but
+            // whose pipeline hasn't started is waiting for an executor. Only a
+            // build that is really executing gets timed against the estimate.
+            let state = match (&p.build_url, &progress) {
+                (None, _) => BuildState::Queued,
+                (Some(_), Some(pr)) if pr.waiting => BuildState::Waiting,
+                (Some(_), _) => BuildState::Building,
+            };
+            // Jenkins' own wording for a not-yet-started item ("Waiting for
+            // next available executor"), looked up only while it is queued.
+            let why = match (&p.queue_url, &jenkins, state) {
+                (Some(q), Some(j), BuildState::Queued) => j.queue_why(q),
+                _ => None,
+            };
             BuildRow {
-                state: if p.build_url.is_some() {
-                    BuildState::Building
-                } else {
-                    BuildState::Queued
-                },
+                state,
                 label: p.label(),
+                job: p.job_name(),
+                build: p.build_url.as_deref().and_then(build_number),
                 repo: p.repo.clone(),
                 age_secs: t.saturating_sub(p.queued_at),
                 elapsed: progress.as_ref().map(|pr| pr.elapsed),
                 estimated: progress.as_ref().and_then(|pr| pr.estimated),
+                stage: progress.as_ref().and_then(|pr| pr.stage.clone()),
+                why,
             }
         })
         .collect();
@@ -410,10 +451,29 @@ fn tui_snapshot(view: crate::tui::View) -> Result<crate::tui::Snapshot> {
 }
 
 /// Launch the ratatui dashboard for a non-`Follow` view. The refresh callback
-/// is a no-op (the cron watcher advances the pipeline); `--follow` uses
-/// `run_follow_tui` instead, which advances it inline.
+/// is a no-op (the cron watcher advances the pipeline); `--follow` advances it
+/// inline instead.
+///
+/// With nothing to watch, the TUI would draw one frame, see an empty pipeline,
+/// exit and leave the alternate screen — a flash and no output. So the empty
+/// case prints the plain snapshot and stays out of the TUI entirely.
 fn run_tui(view: crate::tui::View) -> Result<()> {
+    if tui_snapshot(view)?.is_drained() {
+        return print_empty(view);
+    }
     crate::tui::run(view, || Ok(()), move || tui_snapshot(view))?;
+    Ok(())
+}
+
+/// The plain "nothing to show" summary for a live view, used when there is
+/// nothing to open the TUI for.
+fn print_empty(view: crate::tui::View) -> Result<()> {
+    if view.shows_builds() {
+        show_once()?;
+    }
+    if view.shows_syncs() {
+        sync_status_once()?;
+    }
     Ok(())
 }
 
@@ -445,19 +505,20 @@ fn show_once() -> Result<bool> {
         None
     };
     for p in &q.items {
-        let building = p.build_url.is_some();
-        let state = if building {
-            style::bold_cyan("building")
-        } else {
-            style::yellow("queued  ")
-        };
         let progress = match (&p.build_url, &jenkins) {
-            (Some(url), Some(j)) => j
-                .build_progress(url)
-                .map(|pr| format!(", {}", pr.hint()))
-                .unwrap_or_default(),
-            _ => String::new(),
+            (Some(url), Some(j)) => j.build_progress(url),
+            _ => None,
         };
+        // Same three states the dashboard shows: a build that has a number but
+        // no executor is waiting, not building.
+        let state = match (&p.build_url, &progress) {
+            (None, _) => style::yellow("queued  "),
+            (Some(_), Some(pr)) if pr.waiting => style::yellow("waiting "),
+            (Some(_), _) => style::bold_cyan("building"),
+        };
+        let progress = progress
+            .map(|pr| format!(", {}", pr.hint()))
+            .unwrap_or_default();
         println!(
             "  {} {state}  {}  {}",
             style::busy(),
@@ -507,6 +568,11 @@ pub fn follow() -> Result<()> {
     };
 
     if std::io::stdout().is_terminal() {
+        // Nothing in flight: say so rather than flashing an empty screen.
+        advance()?;
+        if tui_snapshot(crate::tui::View::Follow)?.is_drained() {
+            return print_empty(crate::tui::View::Follow);
+        }
         let drained = crate::tui::run(
             crate::tui::View::Follow,
             advance,
@@ -544,41 +610,126 @@ pub fn follow() -> Result<()> {
     }
 }
 
-/// `sts --log`: print the last `n` lines of the watch log.
+/// `sts -L`: the deploy watcher's log. On a terminal this opens the TUI log
+/// viewer and follows the file (scrollback, wrap, follow/pause); piped or
+/// redirected it prints the last `n` lines and exits, which is what scripts and
+/// `grep` want.
 pub fn tail_log(n: usize) -> Result<()> {
     let path = log_file();
-    let text = match fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("No watch log yet ({}).", path.display());
-            return Ok(());
+    if !std::io::stdout().is_terminal() {
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("No watch log yet ({}).", path.display());
+                return Ok(());
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        for line in &lines[lines.len().saturating_sub(n)..] {
+            println!("{line}");
         }
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    for line in &lines[start..] {
-        println!("{line}");
+        return Ok(());
     }
-    Ok(())
+
+    // Terminal: follow the file in the viewer. `cursor` is how far through the
+    // file we have read; a file that shrinks (rotated by the watcher) is read
+    // from the start again.
+    let mut cursor: u64 = 0;
+    let mut primed = false;
+    let follow_path = path.clone();
+    crate::tui::run_logs(
+        "watch log",
+        vec![("file".to_string(), path.display().to_string())],
+        Duration::from_secs(1),
+        move || {
+            let text = match fs::read_to_string(&follow_path) {
+                Ok(t) => t,
+                Err(_) if primed => return Vec::new(),
+                Err(_) => {
+                    primed = true;
+                    return vec![crate::tui::LogLine::note(format!(
+                        "No watch log yet ({})",
+                        follow_path.display()
+                    ))];
+                }
+            };
+            let size = text.len() as u64;
+            if size < cursor {
+                // Rotated/truncated: start over rather than skipping content.
+                cursor = 0;
+            }
+            // Slice on a character boundary: the file grew since the last
+            // read, and a byte offset from the previous read can land inside a
+            // multi-byte character of the new content. `get` returns None then,
+            // and re-showing the whole tail is better than panicking.
+            let fresh = text.get(cursor as usize..).unwrap_or(&text).to_string();
+            cursor = size;
+            let mut lines: Vec<crate::tui::LogLine> = Vec::new();
+            if !primed {
+                primed = true;
+                // First pass: show the tail, not the whole history.
+                let all: Vec<&str> = text.lines().collect();
+                lines.extend(
+                    all[all.len().saturating_sub(n)..]
+                        .iter()
+                        .map(|l| crate::tui::LogLine::plain(*l)),
+                );
+                return lines;
+            }
+            lines.extend(
+                fresh
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(crate::tui::LogLine::plain),
+            );
+            lines
+        },
+    )
 }
 
-/// `sts -l [app]`: tail an ArgoCD app's container logs. Polls every
-/// `LOGS_POLL_SECS` and appends only lines newer than the last one seen per pod,
-/// so the terminal scrolls like `kubectl logs -f` instead of being redrawn.
-///
-/// `app` is optional: when omitted it is auto-detected from `repo` (the current
-/// repo's Jenkins job -> Helm chart -> ArgoCD app, the same mapping the deploy
-/// watcher uses). Apps can run across several namespaces, so when the app's pods
-/// span more than one and no `namespace` was given, we ask which to view
-/// (listing them). With a single namespace we use it; `namespace` can also be
-/// passed to skip the prompt.
-pub fn logs(
+/// What `sts -l` resolved before it starts tailing: which app, namespace, pods
+/// and container. Collected through the [`Ui`](crate::ui::Ui) so the picking
+/// happens in the TUI (or as plain prompts when piped).
+pub struct LogTarget {
+    pub app: String,
+    pub namespace: Option<String>,
+    pub container: Option<String>,
+    pub pods: Vec<argocd::Pod>,
+}
+
+impl LogTarget {
+    /// The key/value summary the viewer shows under its title.
+    fn meta(&self) -> Vec<(String, String)> {
+        let mut meta = vec![("app".to_string(), self.app.clone())];
+        if let Some(ns) = &self.namespace {
+            meta.push(("namespace".to_string(), ns.clone()));
+        }
+        meta.push((
+            "pods".to_string(),
+            if self.pods.len() == 1 {
+                self.pods[0].name.clone()
+            } else {
+                format!("{}", self.pods.len())
+            },
+        ));
+        if let Some(c) = &self.container {
+            meta.push(("container".to_string(), c.clone()));
+        }
+        meta
+    }
+}
+
+/// Resolve what to tail: the app (explicit or auto-detected from the repo), the
+/// namespace (explicit, the only one, or picked) and the pods to read. Reports
+/// each step through `ui`, so the TUI shows the resolution and can ask.
+pub fn resolve_log_target(
+    ui: &mut dyn crate::ui::Ui,
     app: Option<String>,
     repo: Option<String>,
     namespace: Option<String>,
     container: Option<String>,
-) -> Result<()> {
+) -> Result<LogTarget> {
     let Some(cfg) = config::load_argo()? else {
         bail!(
             "no ArgoCD token configured (argocd_token in {}); can't read logs",
@@ -587,13 +738,15 @@ pub fn logs(
     };
     let argo = Argo::new(cfg);
 
-    // Resolve the ArgoCD app: explicit name, or auto-detected from the repo.
     let app = match app {
         Some(a) => a,
-        None => resolve_app_for_repo(&argo, repo.as_deref())?,
+        None => {
+            ui.step("Detecting the ArgoCD app for this repo");
+            resolve_app_for_repo(ui, &argo, repo.as_deref())?
+        }
     };
 
-    // Discover the app's pods (and the namespaces they run in) up front.
+    ui.step(&format!("Finding the pods of `{app}`"));
     let pods = argo
         .pods(&app)
         .with_context(|| format!("listing pods of ArgoCD app `{app}`"))?;
@@ -608,12 +761,11 @@ pub fn logs(
         .collect();
     namespaces.sort();
     namespaces.dedup();
+    let ns = choose_namespace(ui, &app, namespace, &namespaces)?;
 
-    let ns = choose_namespace(&app, namespace, &namespaces)?;
-
-    let selected: Vec<&argocd::Pod> = pods
-        .iter()
-        .filter(|p| ns.as_deref().map(|n| p.namespace == n).unwrap_or(true))
+    let selected: Vec<argocd::Pod> = pods
+        .into_iter()
+        .filter(|p| ns.as_deref().is_none_or(|n| p.namespace == n))
         .collect();
     if selected.is_empty() {
         bail!(
@@ -622,100 +774,225 @@ pub fn logs(
             namespaces.join(", ")
         );
     }
-
-    println!(
-        "{}  {}  {}",
-        style::bold_cyan(&format!("sts -l {app}")),
-        style::dim(&format!(
-            "{} pod(s){}{}",
-            selected.len(),
-            ns.as_deref()
-                .map(|n| format!(" in {n}"))
-                .unwrap_or_default(),
-            container
-                .as_deref()
-                .map(|c| format!(", container {c}"))
-                .unwrap_or_default(),
-        )),
-        style::dim(&format!("(polling every {LOGS_POLL_SECS}s, Ctrl-C to stop)")),
-    );
     for p in &selected {
         let health = if p.health.is_empty() {
             String::new()
         } else {
             format!(" ({})", p.health)
         };
-        println!("  {}{health}", p.name);
+        ui.kv("pod", &format!("{}{health}", p.name));
     }
 
-    // Last timestamp printed per pod, so each poll only appends newer lines.
-    let mut last_ts: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let multi = selected.len() > 1;
-    let out = std::io::stdout();
+    Ok(LogTarget {
+        app,
+        namespace: ns,
+        container,
+        pods: selected,
+    })
+}
 
+/// Tail a resolved target. On a terminal this runs the TUI viewer; piped it
+/// appends new lines to stdout like `kubectl logs -f`, as before.
+pub fn tail_logs(target: LogTarget) -> Result<()> {
+    let Some(cfg) = config::load_argo()? else {
+        bail!("no ArgoCD token configured; can't read logs");
+    };
+    let argo = Argo::new(cfg);
+    let mut poller = LogPoller::new(target.pods.clone(), target.container.clone());
+    let app = target.app.clone();
+
+    if std::io::stdout().is_terminal() {
+        let meta = target.meta();
+        return crate::tui::run_logs(
+            &format!("logs · {app}"),
+            meta,
+            Duration::from_secs(LOGS_POLL_SECS),
+            move || poller.poll(&argo, &app),
+        );
+    }
+
+    // Piped: stream plainly and never return.
+    println!(
+        "{}  {}",
+        style::bold_cyan(&format!("sts -l {app}")),
+        style::dim(&format!(
+            "{} pod(s){}, polling every {LOGS_POLL_SECS}s",
+            target.pods.len(),
+            target
+                .namespace
+                .as_deref()
+                .map(|n| format!(" in {n}"))
+                .unwrap_or_default()
+        ))
+    );
+    let out = std::io::stdout();
     loop {
-        for pod in &selected {
+        for line in poller.poll(&argo, &app) {
+            let mut handle = out.lock();
+            match line.source {
+                Some(src) => {
+                    let _ = writeln!(handle, "[{src}] {}", line.text);
+                }
+                None => {
+                    let _ = writeln!(handle, "{}", line.text);
+                }
+            }
+            let _ = handle.flush();
+        }
+        std::thread::sleep(Duration::from_secs(LOGS_POLL_SECS));
+    }
+}
+
+/// Polls each pod's log and yields only the lines it hasn't yielded before, so
+/// neither the viewer nor a pipe sees duplicates — and, just as importantly,
+/// nothing is skipped.
+///
+/// Each poll asks for the last `LOGS_TAIL` lines, so consecutive responses
+/// overlap. The overlap is resolved by *position*: remember the last line
+/// emitted for a pod and, in the next response, emit everything after it.
+/// Comparing timestamps instead (the obvious approach) silently loses lines,
+/// because several lines routinely carry the same timestamp.
+struct LogPoller {
+    pods: Vec<argocd::Pod>,
+    container: Option<String>,
+    /// The last line emitted per pod, matched against the next response.
+    last: std::collections::HashMap<String, argocd::LogLine>,
+    /// Prefix lines with the pod name (only worth it with several pods).
+    multi: bool,
+    /// Pod name → short label for that prefix.
+    labels: std::collections::HashMap<String, String>,
+}
+
+/// Shorten pod names for the log prefix. Pods of one app share a long prefix
+/// (`soochi-dash-app-7d9f-abcde`, `soochi-dash-app-5c4e-fghij`), which would
+/// eat the width of every line; strip what they all have in common and keep
+/// what tells them apart.
+fn short_pod_labels(pods: &[argocd::Pod]) -> std::collections::HashMap<String, String> {
+    let names: Vec<&str> = pods.iter().map(|p| p.name.as_str()).collect();
+    let mut labels = std::collections::HashMap::new();
+    // Longest common prefix, cut back to a `-` so a label never starts
+    // mid-token.
+    let mut common = names.first().copied().unwrap_or("").to_string();
+    for n in &names[names.len().min(1)..] {
+        let keep = common
+            .chars()
+            .zip(n.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        common.truncate(common.char_indices().nth(keep).map_or(common.len(), |(i, _)| i));
+    }
+    let cut = match common.rfind('-') {
+        Some(i) if names.len() > 1 => i + 1,
+        _ => 0,
+    };
+    for name in names {
+        // Too short to be recognisable? Keep the full name.
+        let short = &name[cut.min(name.len())..];
+        labels.insert(
+            name.to_string(),
+            if short.len() >= 4 { short.to_string() } else { name.to_string() },
+        );
+    }
+    labels
+}
+
+/// Which lines of `lines` are new, given the last one already emitted.
+///
+/// The responses overlap, so find that line in the new batch (searching from
+/// the end, since the same text can repeat) and take everything after it. If
+/// it isn't there the window has slid past it — fall back to the timestamp so
+/// at least nothing is shown twice.
+fn new_lines<'a>(lines: &'a [argocd::LogLine], last: Option<&argocd::LogLine>) -> &'a [argocd::LogLine] {
+    let Some(last) = last else {
+        // First poll: everything the tail gave us.
+        return lines;
+    };
+    if let Some(i) = lines.iter().rposition(|l| l == last) {
+        return &lines[i + 1..];
+    }
+    let from = lines
+        .iter()
+        .position(|l| l.ts.as_str() > last.ts.as_str())
+        .unwrap_or(lines.len());
+    &lines[from..]
+}
+
+impl LogPoller {
+    fn new(pods: Vec<argocd::Pod>, container: Option<String>) -> LogPoller {
+        let multi = pods.len() > 1;
+        let labels = short_pod_labels(&pods);
+        LogPoller {
+            pods,
+            container,
+            last: std::collections::HashMap::new(),
+            multi,
+            labels,
+        }
+    }
+
+    fn poll(&mut self, argo: &Argo, app: &str) -> Vec<crate::tui::LogLine> {
+        // (timestamp, line): collected per pod, then merged in time order so
+        // several pods read as one chronological stream instead of one pod's
+        // block after another's.
+        let mut batch: Vec<(String, crate::tui::LogLine)> = Vec::new();
+        let mut out = Vec::new();
+        for pod in &self.pods {
             let lines = match argo.logs(
-                &app,
+                app,
                 &pod.namespace,
                 &pod.name,
-                container.as_deref(),
+                self.container.as_deref(),
                 LOGS_TAIL,
             ) {
                 Ok(l) => l,
                 Err(e) => {
-                    // Transient error (pod restart, brief 5xx): note it and keep going.
-                    eprintln!("  (logs for {} failed: {e:#})", pod.name);
+                    // Transient (pod restart, brief 5xx): surface it and keep
+                    // tailing the others.
+                    out.push(crate::tui::LogLine::error(format!(
+                        "logs for {} failed: {e:#}",
+                        pod.name
+                    )));
                     continue;
                 }
             };
-
-            let seen = last_ts.get(&pod.name).cloned().unwrap_or_default();
-            let mut newest = seen.clone();
-            let mut handle = out.lock();
-            for line in &lines {
-                // Only append lines strictly after the last timestamp we printed
-                // for this pod. Timestamps are RFC3339, so lexicographic order
-                // matches chronological order. Lines with no timestamp are only
-                // printed on the first poll (when `seen` is empty).
-                let newer = if line.ts.is_empty() {
-                    seen.is_empty()
+            let fresh = new_lines(&lines, self.last.get(&pod.name));
+            for line in fresh {
+                let rendered = if self.multi {
+                    let label = self
+                        .labels
+                        .get(&pod.name)
+                        .map(String::as_str)
+                        .unwrap_or(&pod.name);
+                    crate::tui::LogLine::from(label, line.content.clone())
                 } else {
-                    line.ts.as_str() > seen.as_str()
+                    crate::tui::LogLine::plain(line.content.clone())
                 };
-                if !newer {
-                    continue;
-                }
-                if multi {
-                    let _ = writeln!(handle, "[{}] {}", pod.name, line.content);
-                } else {
-                    let _ = writeln!(handle, "{}", line.content);
-                }
-                if line.ts > newest {
-                    newest = line.ts.clone();
-                }
+                batch.push((line.ts.clone(), rendered));
             }
-            let _ = handle.flush();
-            drop(handle);
-            if !newest.is_empty() {
-                last_ts.insert(pod.name.clone(), newest);
-            } else if seen.is_empty() {
-                // First poll of a pod with no timestamps: mark it seen so we don't
-                // reprint the same untimestamped tail every interval.
-                last_ts.insert(pod.name.clone(), String::new());
+            // Remember where we got to, even when this poll added nothing.
+            if let Some(newest) = lines.last() {
+                self.last.insert(pod.name.clone(), newest.clone());
             }
         }
-        std::thread::sleep(Duration::from_secs(LOGS_POLL_SECS));
+        // RFC3339 sorts chronologically as text. A stable sort keeps each pod's
+        // own order intact where timestamps tie.
+        batch.sort_by(|a, b| a.0.cmp(&b.0));
+        out.extend(batch.into_iter().map(|(_, line)| line));
+        out
     }
 }
 
 /// Auto-detect the ArgoCD app to tail from a repo: look up the repo's Jenkins
 /// job(s), take each job's chart name (its last path segment) and map it to an
 /// ArgoCD app the same way the deploy watcher does (`app_for_chart`). With one
-/// app we use it; with several we ask on a terminal (or bail with the list when
-/// piped). Errors clearly when the repo has no job or none of its charts match
-/// an app, pointing at `-l <app>` as the fallback.
-fn resolve_app_for_repo(argo: &Argo, repo: Option<&str>) -> Result<String> {
+/// app we use it; with several we ask through the UI (which bails with the list
+/// when there is nobody to ask). Errors clearly when the repo has no job or
+/// none of its charts match an app, pointing at `-l <app>` as the fallback.
+fn resolve_app_for_repo(
+    ui: &mut dyn crate::ui::Ui,
+    argo: &Argo,
+    repo: Option<&str>,
+) -> Result<String> {
     let Some(slug) = repo else {
         bail!("no repo to auto-detect the app from; pass the app name: `sts -l <app>`");
     };
@@ -749,43 +1026,33 @@ fn resolve_app_for_repo(argo: &Argo, repo: Option<&str>) -> Result<String> {
             charts.join(", ")
         ),
         1 => {
-            println!("auto-detected app `{}` for {slug}", matched[0]);
+            ui.kv("app", &format!("{} (from {slug})", matched[0]));
             Ok(matched.remove(0))
         }
         _ => {
-            if !std::io::stdin().is_terminal() {
-                bail!(
-                    "`{slug}` maps to several ArgoCD apps ({}); pass one: `sts -l <app>`",
-                    matched.join(", ")
-                );
-            }
-            println!("`{slug}` maps to several ArgoCD apps:");
-            for (i, a) in matched.iter().enumerate() {
-                println!("  {}. {a}", i + 1);
-            }
-            print!("Tail which app? [1-{}] ", matched.len());
-            std::io::stdout().flush()?;
-            let mut answer = String::new();
-            std::io::stdin().lock().read_line(&mut answer)?;
-            let answer = answer.trim();
-            if let Ok(i) = answer.parse::<usize>()
-                && (1..=matched.len()).contains(&i)
-            {
-                return Ok(matched.remove(i - 1));
-            }
-            if let Some(a) = matched.iter().find(|a| a.as_str() == answer) {
-                return Ok(a.clone());
-            }
-            bail!("`{answer}` is not one of the listed apps");
+            let items: Vec<(String, String)> = matched
+                .iter()
+                .map(|a| (a.clone(), String::new()))
+                .collect();
+            let picked = ui
+                .choose(&format!("`{slug}` maps to several apps — tail which?"), &items, false)
+                .with_context(|| {
+                    format!(
+                        "`{slug}` maps to several ArgoCD apps ({}); pass one: `sts -l <app>`",
+                        matched.join(", ")
+                    )
+                })?;
+            Ok(matched.remove(picked[0]))
         }
     }
 }
 
 /// Pick the namespace to view. With one namespace (or none reported) use it.
-/// With several and no explicit choice, ask on a terminal (listing them) or, if
-/// stdin isn't a terminal, bail with the list so the user can pass `-N`.
+/// With several and no explicit choice, ask through the UI (which bails with
+/// the list when there is nobody to ask, so `-N` can be passed instead).
 /// An explicit `wanted` must match one the app actually runs in.
 fn choose_namespace(
+    ui: &mut dyn crate::ui::Ui,
     app: &str,
     wanted: Option<String>,
     namespaces: &[String],
@@ -803,32 +1070,24 @@ fn choose_namespace(
         0 => Ok(None),
         1 => Ok(Some(namespaces[0].clone())),
         _ => {
-            if !std::io::stdin().is_terminal() {
-                bail!(
-                    "`{app}` runs in {} namespaces ({}); pass -N <namespace> to pick one",
-                    namespaces.len(),
-                    namespaces.join(", ")
-                );
-            }
-            println!("`{app}` runs in several namespaces:");
-            for (i, n) in namespaces.iter().enumerate() {
-                println!("  {}. {n}", i + 1);
-            }
-            print!("View which namespace? [1-{}] ", namespaces.len());
-            std::io::stdout().flush()?;
-            let mut answer = String::new();
-            std::io::stdin().lock().read_line(&mut answer)?;
-            let answer = answer.trim();
-            // Accept either the number or the namespace name typed out.
-            if let Ok(i) = answer.parse::<usize>()
-                && (1..=namespaces.len()).contains(&i)
-            {
-                return Ok(Some(namespaces[i - 1].clone()));
-            }
-            if let Some(n) = namespaces.iter().find(|n| n.as_str() == answer) {
-                return Ok(Some(n.clone()));
-            }
-            bail!("`{answer}` is not one of the listed namespaces");
+            let items: Vec<(String, String)> = namespaces
+                .iter()
+                .map(|n| (n.clone(), String::new()))
+                .collect();
+            let picked = ui
+                .choose(
+                    &format!("`{app}` runs in several namespaces — view which?"),
+                    &items,
+                    false,
+                )
+                .with_context(|| {
+                    format!(
+                        "`{app}` runs in {} namespaces ({}); pass -N <namespace> to pick one",
+                        namespaces.len(),
+                        namespaces.join(", ")
+                    )
+                })?;
+            Ok(Some(namespaces[picked[0]].clone()))
         }
     }
 }
@@ -913,6 +1172,10 @@ fn check_syncing(mode: SyncMode) -> Result<(bool, Option<Vec<SyncRow>>)> {
         // treat it as done so they don't spin.
         return Ok((true, None));
     };
+    // Captured before the client takes the config: used to build each row's
+    // clickable app URL.
+    let argo_base = argo_cfg.url.trim_end_matches('/').to_string();
+    let app_url = |app: &str| format!("{argo_base}/applications/{app}");
     let argo = Argo::new(argo_cfg);
 
     let t = now();
@@ -937,6 +1200,7 @@ fn check_syncing(mode: SyncMode) -> Result<(bool, Option<Vec<SyncRow>>)> {
                 app: s.app.clone(),
                 detail: format!("not settled after {}m", MAX_AGE_SECS / 60),
                 repo: s.repo.clone(),
+                url: app_url(&s.app),
                 age_secs: age,
             });
             if notify {
@@ -962,6 +1226,7 @@ fn check_syncing(mode: SyncMode) -> Result<(bool, Option<Vec<SyncRow>>)> {
                     app: s.app.clone(),
                     detail: "no such ArgoCD app".to_string(),
                     repo: s.repo.clone(),
+                    url: app_url(&s.app),
                     age_secs: age,
                 });
                 if notify {
@@ -981,6 +1246,7 @@ fn check_syncing(mode: SyncMode) -> Result<(bool, Option<Vec<SyncRow>>)> {
                     app: s.app.clone(),
                     detail: st.health.clone(),
                     repo: s.repo.clone(),
+                    url: app_url(&s.app),
                     age_secs: age,
                 });
                 if notify {
@@ -1006,6 +1272,7 @@ fn check_syncing(mode: SyncMode) -> Result<(bool, Option<Vec<SyncRow>>)> {
                     app: s.app.clone(),
                     detail: format!("{}/{}", st.sync, st.health),
                     repo: s.repo.clone(),
+                    url: app_url(&s.app),
                     age_secs: age,
                 });
                 if notify {
@@ -1039,6 +1306,7 @@ fn check_syncing(mode: SyncMode) -> Result<(bool, Option<Vec<SyncRow>>)> {
                         app: s.app.clone(),
                         detail: format!("{}/{}{phase}", st.sync, st.health),
                         repo: s.repo.clone(),
+                        url: app_url(&s.app),
                         age_secs: age,
                     });
                 }
@@ -1060,6 +1328,7 @@ fn check_syncing(mode: SyncMode) -> Result<(bool, Option<Vec<SyncRow>>)> {
                         app: s.app.clone(),
                         detail: "status check failed".to_string(),
                         repo: s.repo.clone(),
+                        url: app_url(&s.app),
                         age_secs: age,
                     });
                 }
@@ -1142,7 +1411,6 @@ pub fn tick() -> Result<()> {
     };
     let argo = Argo::new(argo_cfg);
     let mut apps: Option<Vec<App>> = None;
-
     let mut keep = Vec::new();
     for mut p in std::mem::take(&mut q.items) {
         if now().saturating_sub(p.queued_at) > MAX_AGE_SECS {
@@ -1531,6 +1799,144 @@ pub fn utc_now() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    fn pod(name: &str) -> argocd::Pod {
+        argocd::Pod {
+            name: name.to_string(),
+            namespace: "stage".to_string(),
+            health: "Healthy".to_string(),
+        }
+    }
+
+    #[test]
+    fn pod_labels_drop_the_prefix_every_pod_shares() {
+        let pods = [
+            pod("soochi-dash-app-7d9f8-abcde"),
+            pod("soochi-dash-app-7d9f8-fghij"),
+        ];
+        let labels = short_pod_labels(&pods);
+        assert_eq!(labels[&pods[0].name], "abcde");
+        assert_eq!(labels[&pods[1].name], "fghij");
+    }
+
+    #[test]
+    fn a_single_pod_keeps_its_full_name() {
+        let pods = [pod("soochi-dash-app-7d9f8-abcde")];
+        let labels = short_pod_labels(&pods);
+        assert_eq!(labels[&pods[0].name], "soochi-dash-app-7d9f8-abcde");
+    }
+
+    #[test]
+    fn unrelated_pod_names_are_left_alone() {
+        let pods = [pod("api-1"), pod("worker-2")];
+        let labels = short_pod_labels(&pods);
+        assert_eq!(labels[&pods[0].name], "api-1");
+        assert_eq!(labels[&pods[1].name], "worker-2");
+    }
+
+    #[test]
+    fn labels_that_would_be_too_short_keep_the_full_name() {
+        // Stripping the shared prefix would leave "a"/"b" — not recognisable.
+        let pods = [pod("deploy-abc-a"), pod("deploy-abc-b")];
+        let labels = short_pod_labels(&pods);
+        assert_eq!(labels[&pods[0].name], "deploy-abc-a");
+    }
+
+    fn log(ts: &str, content: &str) -> argocd::LogLine {
+        argocd::LogLine { ts: ts.to_string(), content: content.to_string() }
+    }
+
+    #[test]
+    fn the_first_poll_shows_the_whole_tail() {
+        let batch = [log("t1", "a"), log("t2", "b")];
+        assert_eq!(new_lines(&batch, None).len(), 2);
+    }
+
+    #[test]
+    fn overlapping_polls_emit_only_what_is_new() {
+        let first = [log("t1", "a"), log("t2", "b"), log("t3", "c")];
+        let last = first.last().unwrap().clone();
+        // Next poll: the window slid by one, so two lines overlap.
+        let second = [log("t2", "b"), log("t3", "c"), log("t4", "d")];
+        let fresh = new_lines(&second, Some(&last));
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].content, "d");
+    }
+
+    #[test]
+    fn lines_sharing_a_timestamp_are_not_lost() {
+        // This is what the stage cluster actually produces: a request line and
+        // its JSON tail, logged in the same instant. A cursor that compared
+        // timestamps dropped the second one.
+        let first = [log("06:21:47Z", "info: GET /health 200")];
+        let last = first.last().unwrap().clone();
+        let second = [
+            log("06:21:47Z", "info: GET /health 200"),
+            log("06:21:47Z", " {\"service_name\":\"dukandar-soochi\"}"),
+            log("06:21:48Z", "info: GET /health 200"),
+        ];
+        let fresh = new_lines(&second, Some(&last));
+        assert_eq!(fresh.len(), 2, "same-second lines must still come through");
+        assert!(fresh[0].content.contains("service_name"));
+    }
+
+    #[test]
+    fn nothing_new_emits_nothing() {
+        let batch = [log("t1", "a"), log("t2", "b")];
+        let last = batch.last().unwrap().clone();
+        assert!(new_lines(&batch, Some(&last)).is_empty());
+    }
+
+    #[test]
+    fn repeated_identical_lines_are_resolved_from_the_end() {
+        // A health check logs the same text over and over; matching the *last*
+        // occurrence is what keeps the cursor moving forward.
+        let last = log("t2", "same");
+        let batch = [
+            log("t1", "same"),
+            log("t2", "same"),
+            log("t3", "new"),
+        ];
+        let fresh = new_lines(&batch, Some(&last));
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].content, "new");
+    }
+
+    #[test]
+    fn a_window_that_slid_past_falls_back_to_the_timestamp() {
+        // The pod logged so much that the previous line is no longer in the
+        // tail: emit what is newer than it rather than repeating the batch.
+        let last = log("t1", "gone");
+        let batch = [log("t5", "e"), log("t6", "f")];
+        let fresh = new_lines(&batch, Some(&last));
+        assert_eq!(fresh.len(), 2);
+
+        // …and if everything in the batch is older, show nothing rather than
+        // re-showing history.
+        let last = log("t9", "newest");
+        assert!(new_lines(&batch, Some(&last)).is_empty());
+    }
+
+    #[test]
+    fn multi_pod_output_is_merged_in_time_order() {
+        // Two pods polled in turn produce two blocks; sorting by timestamp is
+        // what makes them read as one stream. (Same sort the poller applies.)
+        let mut batch = [
+            ("06:00:03Z".to_string(), "pod-a third"),
+            ("06:00:01Z".to_string(), "pod-a first"),
+            ("06:00:02Z".to_string(), "pod-b second"),
+        ];
+        batch.sort_by(|a, b| a.0.cmp(&b.0));
+        let order: Vec<&str> = batch.iter().map(|(_, t)| *t).collect();
+        assert_eq!(order, ["pod-a first", "pod-b second", "pod-a third"]);
+    }
+
+    #[test]
+    fn build_numbers_come_from_the_url() {
+        assert_eq!(build_number("https://j/job/x/1423/"), Some(1423));
+        assert_eq!(build_number("https://j/job/x/1423"), Some(1423));
+        assert_eq!(build_number("https://j/job/x/"), None);
+    }
     use super::*;
 
     #[test]

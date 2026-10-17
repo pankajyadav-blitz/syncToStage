@@ -20,12 +20,21 @@ use anyhow::{Context, Result, bail};
 use std::io::{BufRead, IsTerminal, Write};
 
 /// A line in the runner's steps panel: text plus the status it should render
-/// with (glyph + colour).
+/// with (glyph + colour), and how far into the command it was emitted (so the
+/// TUI can show a `mm:ss` gutter).
 #[derive(Clone)]
 pub struct Step {
     pub kind: StepKind,
+    /// Optional short label rendered in a fixed-width column before the text,
+    /// so a run of rows lines up as a table (`repo  …`, `jenkins  …`).
+    pub label: Option<String>,
     pub text: String,
+    /// Seconds since the command started.
+    pub at: u64,
 }
+
+/// Width of the label column in [`Ui::row`] / [`Ui::kv`] output.
+pub const LABEL_W: usize = 9;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum StepKind {
@@ -57,6 +66,16 @@ pub trait Ui {
     fn warn(&mut self, msg: &str);
     fn err(&mut self, msg: &str);
 
+    /// A row of a two-column list: a short `label` in a fixed-width column
+    /// (coloured by `kind`), then the rest. Several rows in a row read as a
+    /// small table — used for the ship plan, `-j`, `-c` and `-H`.
+    fn row(&mut self, kind: StepKind, label: &str, text: &str);
+
+    /// A plain `key   value` row: [`Ui::row`] with no status colour.
+    fn kv(&mut self, key: &str, value: &str) {
+        self.row(StepKind::Detail, key, value);
+    }
+
     /// Ask a yes/no question. Returns the user's answer. In non-interactive
     /// backends this must not be called (the caller passes `-y`), and the
     /// default errors to make that contract explicit.
@@ -74,11 +93,12 @@ pub trait Ui {
         false
     }
 
-    /// Ask the UI to open the live follow dashboard once the command finishes.
-    /// The TUI defers it until after its runner screen tears down (two
-    /// alternate screens can't be nested); the plain backend ignores this and
-    /// the caller follows inline instead.
-    fn request_follow(&mut self) {}
+    /// Tell the UI that the caller will open another full-screen view once this
+    /// command finishes (the follow dashboard after `-s -F`, the log viewer
+    /// after `-l`). The TUI then tears its runner screen down without waiting
+    /// for a key, so the hand-off is seamless — two alternate screens can't be
+    /// nested. The plain backend ignores it.
+    fn request_handoff(&mut self) {}
 }
 
 /// Plain-text UI: exactly the behaviour sts had before the TUI — `println!`
@@ -116,6 +136,19 @@ impl Ui for TermUi {
     }
     fn err(&mut self, msg: &str) {
         println!("{} {msg}", style::err());
+    }
+
+    fn row(&mut self, kind: StepKind, label: &str, text: &str) {
+        // Pad before colouring: escape codes would break `{:<width$}`.
+        let padded = format!("{label:<LABEL_W$}");
+        let (glyph, label) = match kind {
+            StepKind::Ok => (style::ok(), style::green(&padded)),
+            StepKind::Err => (style::err(), style::red(&padded)),
+            StepKind::Warn => (style::yellow("!"), style::yellow(&padded)),
+            StepKind::Step => (style::arrow(), style::bold(&padded)),
+            StepKind::Info | StepKind::Detail => (" ".to_string(), style::dim(&padded)),
+        };
+        println!("{glyph} {label} {text}");
     }
 
     fn confirm(&mut self, question: &str) -> Result<bool> {

@@ -7,6 +7,7 @@
 //! we fall back to a terminal bell and the watch log — the deploy still proceeds.
 
 use crate::config;
+use std::io::IsTerminal;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -42,8 +43,12 @@ fn desktop(level: Level, summary: &str, body: &str) {
         .unwrap_or(false);
     if !ran {
         // No desktop notifier (common on WSL without WSLg): ring the bell so a
-        // watching terminal still gets a cue.
-        eprint!("\x07");
+        // watching terminal gets a cue. Only when stderr really is a terminal —
+        // under cron it is redirected to the watch log, where a bell is just a
+        // stray control byte in the file.
+        if std::io::stderr().is_terminal() {
+            eprint!("\x07");
+        }
     }
 }
 

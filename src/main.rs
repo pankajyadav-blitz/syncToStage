@@ -161,7 +161,7 @@ fn main() {
         print_completions(shell);
         Ok(())
     } else if let Some(repo) = cli.retry {
-        with_ui("retry", |ui| {
+        with_ui("retry", true, |ui| {
             build(ui, BuildArgs {
                 repo: Some(repo),
                 no_argo: cli.no_argo,
@@ -174,7 +174,7 @@ fn main() {
     } else if let Some(app_opt) = cli.logs {
         logs(app_opt, cli.repo, cli.namespace, cli.container)
     } else if cli.ship {
-        with_ui("ship", |ui| {
+        with_ui("ship", true, |ui| {
             ship(ui, ShipArgs {
                 from: cli.from,
                 repo: cli.repo,
@@ -189,7 +189,7 @@ fn main() {
             })
         })
     } else if cli.build {
-        with_ui("build", |ui| {
+        with_ui("build", true, |ui| {
             build(ui, BuildArgs {
                 repo: cli.repo,
                 no_argo: cli.no_argo,
@@ -200,7 +200,7 @@ fn main() {
             })
         })
     } else if cli.jobs {
-        with_ui("jobs", |ui| list_jobs(ui, cli.repo, cli.all))
+        with_ui("jobs", false, |ui| list_jobs(ui, cli.repo, cli.all))
     } else if cli.pending {
         deploy::show()
     } else if cli.sync_status {
@@ -210,11 +210,11 @@ fn main() {
     } else if cli.log {
         deploy::tail_log(200)
     } else if cli.history {
-        with_ui("history", |ui| history::show(ui, cli.repo.as_deref()))
+        with_ui("history", false, |ui| history::show(ui, cli.repo.as_deref()))
     } else if cli.dashboard {
         deploy::dashboard()
     } else if cli.check {
-        with_ui("check", check)
+        with_ui("check", true, check)
     } else if cli.follow {
         deploy::follow()
     } else {
@@ -237,7 +237,10 @@ fn print_completions(shell: Shell) {
 /// runner when stdout is a real terminal and the plain-text backend when it is
 /// piped / redirected (so scripting, CI and `--completions` keep working).
 /// `title` labels the TUI runner screen.
-fn with_ui<F>(title: &str, body: F) -> Result<()>
+/// `timed` marks commands whose output is a sequence of steps that take time
+/// (ship, build, check): those get an elapsed clock and a per-step `mm:ss`
+/// gutter. Listings (`-j`, `-H`) pass false.
+fn with_ui<F>(title: &str, timed: bool, body: F) -> Result<()>
 where
     F: FnOnce(&mut dyn ui::Ui) -> Result<()>,
 {
@@ -245,10 +248,29 @@ where
         // The runner reports whether the command asked to follow; if so, open
         // the live dashboard on a fresh screen now that the runner has torn
         // down (two alternate screens can't be nested).
-        let follow = tui::run_command(title, body)?;
+        let follow = tui::run_command(title, timed, body)?;
         if follow {
             deploy::follow()?;
         }
+        Ok(())
+    } else {
+        let mut term = ui::TermUi::new();
+        body(&mut term)
+    }
+}
+
+/// Like [`with_ui`], but for a command that flows straight into another
+/// full-screen view (the log viewer): the runner tears down without waiting for
+/// a key, so the hand-off is seamless.
+fn with_ui_handoff<F>(title: &str, body: F) -> Result<()>
+where
+    F: FnOnce(&mut dyn ui::Ui) -> Result<()>,
+{
+    if std::io::stdout().is_terminal() {
+        tui::run_command(title, true, |ui| {
+            ui.request_handoff();
+            body(ui)
+        })?;
         Ok(())
     } else {
         let mut term = ui::TermUi::new();
@@ -307,10 +329,11 @@ fn ship(ui: &mut dyn ui::Ui, a: ShipArgs) -> Result<()> {
         return finish_build(ui, &slug, jobs, jenkins, a.no_build, argo, a.wait, a.follow);
     }
 
-    // Summary of what is about to happen.
-    ui.detail(&format!("repo    {slug}"));
-    ui.detail(&format!("merge   {source} ({})", short(&source_sha)));
-    ui.detail(&format!("into    {remote_stage} ({})", short(&remote_stage_sha)));
+    // Summary of what is about to happen, as an aligned label/value table.
+    ui.step("Plan");
+    ui.kv("repo", &slug);
+    ui.kv("merge", &format!("{source} ({})", short(&source_sha)));
+    ui.kv("into", &format!("{remote_stage} ({})", short(&remote_stage_sha)));
     print_commits(ui, &incoming);
     print_diff_summary(ui, &repo_dir, &remote_stage, &format!("refs/heads/{source}"));
     warn_local_stage(ui, &repo_dir, &remote_stage, &remote_stage_sha)?;
@@ -319,7 +342,10 @@ fn ship(ui: &mut dyn ui::Ui, a: ShipArgs) -> Result<()> {
         &["status", "--porcelain", "--untracked-files=no"],
     )?;
     if !dirty.is_empty() {
-        ui.detail("note    uncommitted changes in your working tree are NOT included");
+        ui.kv(
+            "note",
+            "uncommitted changes in your working tree are NOT included",
+        );
     }
     print_jenkins_plan(ui, &slug, &jobs, a.no_build, a.all);
     print_argo_plan(ui, &jobs, a.no_build, a.no_argo, argo);
@@ -494,31 +520,38 @@ fn print_argo_plan(ui: &mut dyn ui::Ui, jobs: &Option<Vec<Job>>, no_build: bool,
         return;
     }
     if no_argo {
-        ui.detail("argocd  skipped (-A)");
+        ui.kv("argocd", "skipped (-A)");
     } else if argo {
-        ui.detail("argocd  sync each app when its build succeeds (cron, see `sts -P`)");
+        ui.kv("argocd", "sync each app when its build succeeds (cron, see `sts -P`)");
     } else {
-        ui.detail("argocd  skipped (no argocd_token configured)");
+        ui.kv("argocd", "skipped (no argocd_token configured)");
     }
 }
 
 fn print_jenkins_plan(ui: &mut dyn ui::Ui, slug: &str, jobs: &Option<Vec<Job>>, no_build: bool, all: bool) {
     match (jobs, no_build) {
-        (_, true) => ui.detail("jenkins skipped (-n)"),
-        (None, _) => ui.detail(&format!("jenkins no job mapped for {slug} (see `sts -ja`)")),
-        (Some(jobs), _) if jobs.len() > 1 && !all => {
-            ui.detail(&format!(
-                "jenkins {} job(s), will ask which to trigger (-a for all):",
-                jobs.len()
-            ));
-            for j in jobs {
-                ui.detail(&format!("          {}", j.raw));
-            }
-        }
+        (_, true) => ui.kv("jenkins", "skipped (-n)"),
+        (None, _) => ui.kv(
+            "jenkins",
+            &format!("no job mapped for {slug} (see `sts -ja`)"),
+        ),
         (Some(jobs), _) => {
-            ui.detail(&format!("jenkins {} job(s):", jobs.len()));
+            let ask = jobs.len() > 1 && !all;
+            ui.kv(
+                "jenkins",
+                &format!(
+                    "{} job(s){}",
+                    jobs.len(),
+                    if ask {
+                        ", will ask which to trigger (-a for all)"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+            // Each job on its own row, named first so the list is scannable.
             for j in jobs {
-                ui.detail(&format!("          {}", j.raw));
+                ui.kv("", &job_line(j));
             }
         }
     }
@@ -783,7 +816,7 @@ fn trigger_all(
     if follow && scheduled {
         if ui.is_tui() {
             ui.info("Following the build + ArgoCD sync — opening the live dashboard…");
-            ui.request_follow();
+            ui.request_handoff();
         } else {
             ui.step("Following the build + ArgoCD sync (Ctrl-C to detach; cron keeps watching)");
             deploy::follow()?;
@@ -814,20 +847,40 @@ fn logs(
     } else {
         repo
     };
-    deploy::logs(app, repo, namespace, container)
+    // Resolve (and ask) inside a runner screen, then hand off to the log
+    // viewer on a fresh screen — two alternate screens can't be nested.
+    let mut target = None;
+    with_ui_handoff("logs", |ui| {
+        target = Some(deploy::resolve_log_target(ui, app, repo, namespace, container)?);
+        Ok(())
+    })?;
+    match target {
+        Some(t) => deploy::tail_logs(t),
+        None => Ok(()),
+    }
 }
 
 
+/// `name                     /job/raw/path` — the job name in a fixed column so
+/// a list of jobs lines up however long the Jenkins paths are.
+fn job_line(job: &Job) -> String {
+    format!("{:<24} {}", job.name(), job.raw)
+}
+
 fn list_jobs(ui: &mut dyn ui::Ui, repo: Option<String>, all: bool) -> Result<()> {
     let map = JobMap::load()?;
-    ui.detail(&format!("mapping: {}", map.source));
     if all {
-        for (repo, paths) in map.all() {
-            ui.info(repo);
+        let repos: Vec<_> = map.all().collect();
+        ui.step(&format!("{} mapped repo(s)", repos.len()));
+        for (repo, paths) in repos {
+            // The repo heads its block; each job is a labelled row under it, so
+            // the name is readable and the raw path stays visible.
+            ui.row(ui::StepKind::Info, "repo", repo);
             for p in paths {
-                ui.detail(p);
+                ui.kv("job", &job_line(&Job::parse(p)));
             }
         }
+        ui.kv("mapping", &map.source);
         return Ok(());
     }
     let slug = match repo {
@@ -836,35 +889,53 @@ fn list_jobs(ui: &mut dyn ui::Ui, repo: Option<String>, all: bool) -> Result<()>
     };
     match map.lookup(&slug) {
         Some(jobs) => {
-            ui.info(&slug);
-            for j in jobs {
-                ui.detail(&j.raw);
+            ui.step(&format!("{} ({} job(s))", slug, jobs.len()));
+            for j in &jobs {
+                ui.kv("job", &job_line(j));
             }
         }
-        None => ui.info(&format!("No Jenkins job is mapped for {slug}.")),
+        None => ui.warn(&format!("No Jenkins job is mapped for {slug}.")),
     }
+    ui.kv("mapping", &map.source);
     Ok(())
 }
 
 fn check(ui: &mut dyn ui::Ui) -> Result<()> {
-    ui.detail(&format!("config: {}", config::config_file().display()));
+    ui.step("Checking config and credentials");
+    ui.kv("config", &config::config_file().display().to_string());
     connect(ui)?;
     match config::load_argo()? {
         Some(cfg) => {
             let argo = argocd::Argo::new(cfg);
             let who = argo.whoami()?;
-            ui.ok(&format!("ArgoCD {} as {who}", argo.url()));
+            ui.row(
+                ui::StepKind::Ok,
+                "argocd",
+                &format!("{} as {who}", argo.url()),
+            );
         }
-        None => ui.warn("ArgoCD: no argocd_token configured; builds won't be synced"),
+        None => ui.row(
+            ui::StepKind::Warn,
+            "argocd",
+            "no argocd_token configured; builds won't be synced",
+        ),
     }
     let map = JobMap::load()?;
-    ui.detail(&format!("mapping: {}", map.source));
+    ui.kv("mapping", &map.source);
     if let Ok(dir) = repo_root()
         && let Ok(slug) = git::repo_slug(&dir, REMOTE)
     {
         match map.lookup(&slug) {
-            Some(jobs) => ui.info(&format!("this repo: {slug} -> {} job(s)", jobs.len())),
-            None => ui.info(&format!("this repo: {slug} -> no job mapped")),
+            Some(jobs) => ui.row(
+                ui::StepKind::Ok,
+                "repo",
+                &format!("{slug} → {} job(s)", jobs.len()),
+            ),
+            None => ui.row(
+                ui::StepKind::Warn,
+                "repo",
+                &format!("{slug} → no job mapped (see `sts -ja`)"),
+            ),
         }
     }
     Ok(())
@@ -873,7 +944,11 @@ fn check(ui: &mut dyn ui::Ui) -> Result<()> {
 fn connect(ui: &mut dyn ui::Ui) -> Result<Jenkins> {
     let jenkins = Jenkins::new(config::load()?);
     let who = jenkins.whoami()?;
-    ui.ok(&format!("Jenkins {} as {who}", jenkins.url()));
+    ui.row(
+        ui::StepKind::Ok,
+        "jenkins",
+        &format!("{} as {who}", jenkins.url()),
+    );
     Ok(jenkins)
 }
 
@@ -951,12 +1026,12 @@ fn update_local_stage(ui: &mut dyn ui::Ui, repo_dir: &Path, sha: &str) {
 fn print_commits(ui: &mut dyn ui::Ui, log: &str) {
     const SHOW: usize = 15;
     let lines: Vec<&str> = log.lines().collect();
-    ui.detail(&format!("commits {} new on stage:", lines.len()));
+    ui.kv("commits", &format!("{} new on stage", lines.len()));
     for l in lines.iter().take(SHOW) {
-        ui.detail(&format!("          {l}"));
+        ui.kv("", l);
     }
     if lines.len() > SHOW {
-        ui.detail(&format!("          ... and {} more", lines.len() - SHOW));
+        ui.kv("", &format!("… and {} more", lines.len() - SHOW));
     }
 }
 
@@ -970,7 +1045,7 @@ fn print_diff_summary(ui: &mut dyn ui::Ui, repo_dir: &Path, base: &str, tip: &st
         let stat = stat.trim();
         if !stat.is_empty() {
             // e.g. "8 files changed, 312 insertions(+), 45 deletions(-)"
-            ui.detail(&format!("diff    {stat}"));
+            ui.kv("diff", stat);
         }
     }
 }
